@@ -51,9 +51,9 @@ impl R2ManagerBuilder {
 
     pub async fn build(self) -> Result<CloudFlareR2, Box<dyn std::error::Error>> {
         let bucket_name = self.bucket_name.ok_or("Bucket name is required")?;
-        let url = self.url.ok_or("Cloudflare KV URI is required")?;
-        let client_id = self.client_id.ok_or("Cloudflare KV client ID is required")?;
-        let secret_key = self.secret_key.ok_or("Cloudflare KV secret is required")?;
+        let url = self.url.ok_or("Cloudflare URL is required")?;
+        let client_id = self.client_id.ok_or("Cloudflare R2 client ID is required")?;
+        let secret_key = self.secret_key.ok_or("Cloudflare R2 secret key is required")?;
 
         std::env::set_var("AWS_ACCESS_KEY_ID", &client_id);
         std::env::set_var("AWS_SECRET_ACCESS_KEY", &secret_key);

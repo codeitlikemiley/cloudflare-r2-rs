@@ -1,17 +1,14 @@
 use std::sync::Arc;
-use aws_config::SdkConfig;
-use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Region;
-use aws_sdk_s3::primitives::ByteStream;
+use std::fs::{create_dir_all, File};
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use aws_sdk_s3::{Client, config::Region, primitives::ByteStream};
+use mime_guess;
+use anyhow::{Result, anyhow, bail};
+use aws_sdk_s3::config::Credentials;
 use log::{debug, error, info};
+use tokio_stream::StreamExt;
 
-// Define states for the S3 operations
-pub enum S3State {
-    NotInitialized,
-    Initialized(SdkConfig),
-}
-
-// Define a builder for the S3Manager
 pub struct R2ManagerBuilder {
     bucket_name: Option<String>,
     url: Option<String>,
@@ -49,35 +46,38 @@ impl R2ManagerBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<CloudFlareR2, Box<dyn std::error::Error>> {
-        let bucket_name = self.bucket_name.ok_or("Bucket name is required")?;
-        let url = self.url.ok_or("Cloudflare URL is required")?;
-        let client_id = self.client_id.ok_or("Cloudflare R2 client ID is required")?;
-        let secret_key = self.secret_key.ok_or("Cloudflare R2 secret key is required")?;
+    pub fn build(self) -> Result<CloudFlareR2> {
+        let bucket_name = self.bucket_name.ok_or_else(|| anyhow!("Bucket name is required"))?;
+        let url = self.url.ok_or_else(|| anyhow!("Cloudflare URL is required"))?;
+        let client_id = self.client_id.ok_or_else(|| anyhow!("Cloudflare R2 client ID is required"))?;
+        let secret_key = self.secret_key.ok_or_else(|| anyhow!("Cloudflare R2 secret key is required"))?;
 
-        std::env::set_var("AWS_ACCESS_KEY_ID", &client_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &secret_key);
+        let credentials = Credentials::new(
+            client_id,
+            secret_key,
+            None,
+            None,
+            "custom_provider",
+        );
 
-        let s3_config = aws_config::load_from_env()
-            .await
-            .into_builder()
-            .endpoint_url(&url)
+        let conf_builder = aws_sdk_s3::config::Builder::new()
             .region(Region::new("us-east-1"))
+            .endpoint_url(&url)
+            .credentials_provider(credentials)
             .build();
+
+        let client = Client::from_conf(conf_builder);
 
         Ok(CloudFlareR2 {
             bucket_name,
-            client: Arc::new(Client::new(&s3_config)),
-            state: S3State::Initialized(s3_config),
+            client: Arc::new(client),
         })
     }
 }
 
-// Define the S3Manager struct
 pub struct CloudFlareR2 {
     bucket_name: String,
     client: Arc<Client>,
-    state: S3State,
 }
 
 impl CloudFlareR2 {
@@ -89,144 +89,154 @@ impl CloudFlareR2 {
         &self.bucket_name
     }
 
-    pub async fn create_bucket(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match &self.state {
-            S3State::Initialized(_) => {
-                let create_bucket_request = self.client
-                    .create_bucket()
-                    .bucket(&self.bucket_name);
+    pub async fn create_bucket(&self) -> Result<()> {
+        let create_bucket_request = self.client.create_bucket().bucket(&self.bucket_name);
 
-                let result = create_bucket_request.send().await;
+        let result = create_bucket_request.send().await;
 
-                if result.is_ok() {
-                    debug!("{:?}", result.unwrap());
-                    info!("Created successfully {}", self.bucket_name);
-                    Ok(())
-                } else {
-                    debug!("{:?}", result.unwrap_err());
-                    error!("Creation of {} failed.", self.bucket_name);
-                    Err("Failed to create bucket".into())
-                }
+        if result.is_ok() {
+            info!("Created successfully {}", self.bucket_name);
+            Ok(())
+        } else {
+            error!("Creation of {} failed.", self.bucket_name);
+            Err(anyhow!("Failed to create bucket"))
+        }
+    }
+
+    pub async fn delete_bucket(&self) -> Result<()> {
+        let delete_bucket_request = self.client.delete_bucket().bucket(&self.bucket_name);
+
+        let result = delete_bucket_request.send().await;
+
+        if result.is_ok() {
+            debug!("{:?}", result.unwrap());
+            info!("Deleted successfully {}", self.bucket_name);
+            Ok(())
+        } else {
+            debug!("{:?}", result.unwrap_err());
+            error!("Deletion of {} failed.", self.bucket_name);
+            Err(anyhow!("Failed to delete bucket"))
+        }
+    }
+
+    pub async fn put_object(&self, key: &str, body: Vec<u8>) -> Result<()> {
+        let content_type = mime_guess::from_path(key).first_or_octet_stream().to_string();
+        let put_object_request = self.client
+            .put_object()
+            .bucket(&self.bucket_name)
+            .key(key)
+            .body(ByteStream::from(body))
+            .content_type(content_type);
+
+        let result = put_object_request.send().await;
+
+        if result.is_ok() {
+            debug!("{:?}", result.unwrap());
+            info!("Put object successfully {}", key);
+            Ok(())
+        } else {
+            debug!("{:?}", result.unwrap_err());
+            error!("Put object {} failed.", key);
+            Err(anyhow!("Failed to put object"))
+        }
+    }
+
+    pub async fn delete_object(&self, key: &str) -> Result<()> {
+        let delete_object_request = self.client
+            .delete_object()
+            .bucket(&self.bucket_name)
+            .key(key);
+
+        let result = delete_object_request.send().await;
+
+        match result {
+            Ok(_) => {
+                info!("Deleted object successfully {}", key);
+                Ok(())
             }
-            _ => {
-                error!("S3 client not initialized");
-                Err("S3 client not initialized".into())
+            Err(e) => {
+                error!("Failed to delete object {}", key);
+                Err(anyhow!(e))
             }
         }
     }
 
-    pub async fn delete_bucket(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match &self.state {
-            S3State::Initialized(_) => {
-                let delete_bucket_request = self.client
-                    .delete_bucket()
-                    .bucket(&self.bucket_name);
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
+        let get_object_request = self.client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(key);
 
-                let result = delete_bucket_request.send().await;
-
-                if result.is_ok() {
-                    debug!("{:?}", result.unwrap());
-                    info!("Deleted successfully {}", self.bucket_name);
-                    Ok(())
-                } else {
-                    debug!("{:?}", result.unwrap_err());
-                    error!("Deletion of {} failed.", self.bucket_name);
-                    Err("Failed to delete bucket".into())
-                }
+        let result = get_object_request.send().await;
+        match result {
+            Ok(response) => {
+                let body = response.body.collect().await?.into_bytes().to_vec();
+                info!("Got object successfully {}", key);
+                Ok(body)
             }
-            _ => {
-                error!("S3 client not initialized");
-                Err("S3 client not initialized".into())
+            Err(e) => {
+                error!("Failed to get object {}", key);
+                Err(anyhow!(e))
             }
         }
     }
 
-    pub async fn put_object(&self, key: &str, body: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
-        match &self.state {
-            S3State::Initialized(_) => {
-                let put_object_request = self.client
-                    .put_object()
-                    .bucket(&self.bucket_name)
-                    .key(key)
-                    .body(ByteStream::from(body));
-
-                let result = put_object_request.send().await;
-
-                if result.is_ok() {
-                    debug!("{:?}", result.unwrap());
-                    info!("Put object successfully {}", key);
-                    Ok(())
-                } else {
-                    debug!("{:?}", result.unwrap_err());
-                    error!("Put object {} failed.", key);
-                    Err("Failed to put object".into())
-                }
-            }
-            _ => {
-                error!("S3 client not initialized");
-                Err("S3 client not initialized".into())
-            }
+    pub async fn download_file(&self, key: &str, dir: &Path) -> Result<()> {
+        if !dir.is_dir() {
+            bail!("Path {} is not a directory", dir.display());
         }
+
+        let file_path = dir.join(key);
+        let parent_dir = file_path
+            .parent()
+            .ok_or_else(|| anyhow!("Invalid parent dir for {:?}", file_path))?;
+        if !parent_dir.exists() {
+            create_dir_all(parent_dir)?;
+        }
+
+        let get_object_request = self.client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(key);
+
+        let result = get_object_request.send().await?;
+        let mut data: ByteStream = result.body;
+        let file = File::create(&file_path)?;
+        let mut buf_writer = BufWriter::new(file);
+
+        while let Some(bytes) = data.try_next().await? {
+            buf_writer.write(&bytes)?;
+        }
+        buf_writer.flush()?;
+        info!("Downloaded {} successfully to {}", key, dir.display());
+        Ok(())
     }
 
-    // delete object
-    pub async fn delete_object(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
-        match &self.state {
-            S3State::Initialized(_) => {
-                let delete_object_request = self.client
-                    .delete_object()
-                    .bucket(&self.bucket_name)
-                    .key(key);
+    pub async fn list_keys(&self) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut continuation_token = None;
 
-                let result = delete_object_request.send().await;
+        loop {
+            let list_objects_request = self.client
+                .list_objects_v2()
+                .bucket(&self.bucket_name)
+                .set_continuation_token(continuation_token.clone());
 
-                match result {
-                    Ok(_) => {
-                        info!("Deleted object successfully {}", key);
-                        Ok(())
+            let result = list_objects_request.send().await?;
+            if let Some(contents) = result.contents {
+                for object in contents {
+                    if let Some(key) = object.key {
+                        keys.push(key);
                     }
-                    Err(e) => {
-                        error!("Failed to delete object {}", key);
-                        Err(e.into())
-                    }
                 }
             }
-            _ => {
-                error!("S3 client not initialized");
-                Err("S3 client not initialized".into())
+
+            if result.is_truncated.unwrap_or(false) {
+                continuation_token = result.next_continuation_token;
+            } else {
+                break;
             }
         }
+        Ok(keys)
     }
-
-    // get object
-    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        match &self.state {
-            S3State::Initialized(_) => {
-                let get_object_request = self.client
-                    .get_object()
-                    .bucket(&self.bucket_name)
-                    .key(key);
-
-                let result = get_object_request.send().await;
-                //result.unwrap().body.collect().await.unwrap().into_bytes().to_vec()
-                match result {
-                    Ok(response) => {
-                        let body = response.body.collect().await.unwrap().into_bytes().to_vec();
-                        info!("Got object successfully {}", key);
-                        Ok(body)
-                    }
-                    Err(e) => {
-                        error!("Failed to get object {}", key);
-                        Err(e.into())
-                    }
-                }
-            }
-            _ => {
-                error!("S3 client not initialized");
-                Err("S3 client not initialized".into())
-            }
-        }
-    }
-
 }
-

@@ -15,12 +15,21 @@ async fn main() {
         .client_id(&client_id)
         .secret_key(&secret_key)
         .build()
-        .await
         .unwrap();
 
-    let _ = put_object(&manager, "./Cargo.toml", "Cargo.toml").await;
-    let _ = get_object(&manager, "Cargo.toml").await;
-    let _ = delete_object(&manager, "Cargo.toml").await;
+    // let _ = put_object(&manager, "./Cargo.toml", "Cargo.toml").await;
+
+
+    // let key = "Screenshot 2024-05-27 at 11.18.41 PM.png";
+    // let dir = std::path::Path::new("src/");
+    // let result =  manager.download_file(key, dir).await;
+    // println!("{:?}", result);
+
+
+    let result = manager.list_keys().await;
+    println!("{:?}", result);
+    // let _ = get_object(&manager, "Cargo.toml").await;
+    // let _ = delete_object(&manager, "Cargo.toml").await;
 
 }
 

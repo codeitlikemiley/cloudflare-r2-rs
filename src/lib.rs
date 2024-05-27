@@ -51,17 +51,17 @@ impl R2ManagerBuilder {
 
     pub async fn build(self) -> Result<CloudFlareR2, Box<dyn std::error::Error>> {
         let bucket_name = self.bucket_name.ok_or("Bucket name is required")?;
-        let cloudflare_kv_uri = self.url.ok_or("Cloudflare KV URI is required")?;
-        let cloudflare_kv_client_id = self.client_id.ok_or("Cloudflare KV client ID is required")?;
-        let cloudflare_kv_secret = self.secret_key.ok_or("Cloudflare KV secret is required")?;
+        let url = self.url.ok_or("Cloudflare KV URI is required")?;
+        let client_id = self.client_id.ok_or("Cloudflare KV client ID is required")?;
+        let secret_key = self.secret_key.ok_or("Cloudflare KV secret is required")?;
 
-        std::env::set_var("AWS_ACCESS_KEY_ID", &cloudflare_kv_client_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &cloudflare_kv_secret);
+        std::env::set_var("AWS_ACCESS_KEY_ID", &client_id);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", &secret_key);
 
         let s3_config = aws_config::load_from_env()
             .await
             .into_builder()
-            .endpoint_url(&cloudflare_kv_uri)
+            .endpoint_url(&url)
             .region(Region::new("us-east-1"))
             .build();
 

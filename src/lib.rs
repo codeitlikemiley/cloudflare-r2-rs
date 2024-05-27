@@ -7,45 +7,103 @@ use mime_guess;
 use anyhow::{Result, anyhow, bail};
 use aws_sdk_s3::config::Credentials;
 use log::{debug, error, info};
-use tokio_stream::StreamExt;
+use std::marker::PhantomData;
 
-pub struct R2ManagerBuilder {
+pub struct EmptyUrl;
+
+pub struct WithUrl;
+
+pub struct EmptyBucket;
+
+pub struct WithBucket;
+
+pub struct EmptyClientId;
+
+pub struct WithClientId;
+
+pub struct EmptySecret;
+
+pub struct WithSecret;
+
+pub struct R2ManagerBuilder<UrlState, BucketState, ClientIdState, SecretState> {
     bucket_name: Option<String>,
     url: Option<String>,
     client_id: Option<String>,
     secret_key: Option<String>,
+    _url_state: PhantomData<UrlState>,
+    _bucket_state: PhantomData<BucketState>,
+    _client_id_state: PhantomData<ClientIdState>,
+    _secret_state: PhantomData<SecretState>,
 }
 
-impl R2ManagerBuilder {
+impl R2ManagerBuilder<EmptyUrl, EmptyBucket, EmptyClientId, EmptySecret> {
     pub fn new() -> Self {
         R2ManagerBuilder {
             bucket_name: None,
             url: None,
             client_id: None,
             secret_key: None,
+            _url_state: PhantomData,
+            _bucket_state: PhantomData,
+            _client_id_state: PhantomData,
+            _secret_state: PhantomData,
         }
     }
+}
 
-    pub fn bucket_name(mut self, bucket_name: &str) -> Self {
-        self.bucket_name = Some(bucket_name.to_string());
-        self
+
+impl<UrlState, BucketState, ClientIdState, SecretState> R2ManagerBuilder<UrlState, BucketState, ClientIdState, SecretState> {
+    pub fn url(self, uri: &str) -> R2ManagerBuilder<WithUrl, BucketState, ClientIdState, SecretState> {
+        R2ManagerBuilder {
+            url: Some(uri.to_string()),
+            bucket_name: self.bucket_name,
+            client_id: self.client_id,
+            secret_key: self.secret_key,
+            _url_state: PhantomData,
+            _bucket_state: PhantomData,
+            _client_id_state: PhantomData,
+            _secret_state: PhantomData,
+        }
     }
-
-    pub fn url(mut self, uri: &str) -> Self {
-        self.url = Some(uri.to_string());
-        self
+    pub fn bucket_name(self, bucket_name: &str) -> R2ManagerBuilder<UrlState, WithBucket, ClientIdState, SecretState> {
+        R2ManagerBuilder {
+            bucket_name: Some(bucket_name.to_string()),
+            url: self.url,
+            client_id: self.client_id,
+            secret_key: self.secret_key,
+            _url_state: PhantomData,
+            _bucket_state: PhantomData,
+            _client_id_state: PhantomData,
+            _secret_state: PhantomData,
+        }
     }
-
-    pub fn client_id(mut self, client_id: &str) -> Self {
-        self.client_id = Some(client_id.to_string());
-        self
+    pub fn client_id(self, client_id: &str) -> R2ManagerBuilder<UrlState, BucketState, WithClientId, SecretState> {
+        R2ManagerBuilder {
+            client_id: Some(client_id.to_string()),
+            bucket_name: self.bucket_name,
+            url: self.url,
+            secret_key: self.secret_key,
+            _url_state: PhantomData,
+            _bucket_state: PhantomData,
+            _client_id_state: PhantomData,
+            _secret_state: PhantomData,
+        }
     }
-
-    pub fn secret_key(mut self, secret: &str) -> Self {
-        self.secret_key = Some(secret.to_string());
-        self
+    pub fn secret_key(self, secret: &str) -> R2ManagerBuilder<UrlState, BucketState, ClientIdState, WithSecret> {
+        R2ManagerBuilder {
+            secret_key: Some(secret.to_string()),
+            bucket_name: self.bucket_name,
+            url: self.url,
+            client_id: self.client_id,
+            _url_state: PhantomData,
+            _bucket_state: PhantomData,
+            _client_id_state: PhantomData,
+            _secret_state: PhantomData,
+        }
     }
+}
 
+impl R2ManagerBuilder<WithUrl, WithBucket, WithClientId, WithSecret> {
     pub fn build(self) -> Result<CloudFlareR2> {
         let bucket_name = self.bucket_name.ok_or_else(|| anyhow!("Bucket name is required"))?;
         let url = self.url.ok_or_else(|| anyhow!("Cloudflare URL is required"))?;
@@ -81,7 +139,7 @@ pub struct CloudFlareR2 {
 }
 
 impl CloudFlareR2 {
-    pub fn builder() -> R2ManagerBuilder {
+    pub fn builder() -> R2ManagerBuilder<EmptyUrl, EmptyBucket, EmptyClientId, EmptySecret> {
         R2ManagerBuilder::new()
     }
 
@@ -119,7 +177,7 @@ impl CloudFlareR2 {
         }
     }
 
-    pub async fn put_object(&self, key: &str, body: Vec<u8>) -> Result<()> {
+    pub async fn put_object(&self, key: &str, body: Vec<u8>) -> Result<String> {
         let content_type = mime_guess::from_path(key).first_or_octet_stream().to_string();
         let put_object_request = self.client
             .put_object()
@@ -128,37 +186,18 @@ impl CloudFlareR2 {
             .body(ByteStream::from(body))
             .content_type(content_type);
 
-        let result = put_object_request.send().await;
-
-        if result.is_ok() {
-            debug!("{:?}", result.unwrap());
-            info!("Put object successfully {}", key);
-            Ok(())
-        } else {
-            debug!("{:?}", result.unwrap_err());
-            error!("Put object {} failed.", key);
-            Err(anyhow!("Failed to put object"))
-        }
+        let _ = put_object_request.send().await?;
+        Ok(key.to_string())
     }
 
-    pub async fn delete_object(&self, key: &str) -> Result<()> {
+    pub async fn delete_object(&self, key: &str) -> Result<bool> {
         let delete_object_request = self.client
             .delete_object()
             .bucket(&self.bucket_name)
             .key(key);
 
-        let result = delete_object_request.send().await;
-
-        match result {
-            Ok(_) => {
-                info!("Deleted object successfully {}", key);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to delete object {}", key);
-                Err(anyhow!(e))
-            }
-        }
+        let _ = delete_object_request.send().await?;
+        Ok(true)
     }
 
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
@@ -166,22 +205,12 @@ impl CloudFlareR2 {
             .get_object()
             .bucket(&self.bucket_name)
             .key(key);
-
-        let result = get_object_request.send().await;
-        match result {
-            Ok(response) => {
-                let body = response.body.collect().await?.into_bytes().to_vec();
-                info!("Got object successfully {}", key);
-                Ok(body)
-            }
-            Err(e) => {
-                error!("Failed to get object {}", key);
-                Err(anyhow!(e))
-            }
-        }
+        let response = get_object_request.send().await?;
+        let body = response.body.collect().await?.into_bytes().to_vec();
+        Ok(body)
     }
 
-    pub async fn download_file(&self, key: &str, dir: &Path) -> Result<()> {
+    pub async fn download_file(&self, key: &str, dir: &Path) -> Result<String> {
         if !dir.is_dir() {
             bail!("Path {} is not a directory", dir.display());
         }
@@ -193,7 +222,6 @@ impl CloudFlareR2 {
         if !parent_dir.exists() {
             create_dir_all(parent_dir)?;
         }
-
         let get_object_request = self.client
             .get_object()
             .bucket(&self.bucket_name)
@@ -208,8 +236,8 @@ impl CloudFlareR2 {
             buf_writer.write(&bytes)?;
         }
         buf_writer.flush()?;
-        info!("Downloaded {} successfully to {}", key, dir.display());
-        Ok(())
+
+        Ok(file_path.to_string_lossy().to_string())
     }
 
     pub async fn list_keys(&self) -> Result<Vec<String>> {

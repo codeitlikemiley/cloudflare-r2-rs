@@ -6,20 +6,22 @@ use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart as SdkCompletedPart};
 use futures::stream::StreamExt;
 
+use crate::body::IntoBody;
 use crate::client::R2Client;
 use crate::error::{from_sdk, Error, Result};
 use crate::object::validate_key;
 use crate::types::{
-    CompletedPart, MultipartOptions, MultipartUpload, PutOptions, PutOutcome,
-    DEFAULT_MULTIPART_THRESHOLD, MAX_PARTS, MIN_PART_SIZE,
+    CompletedPart, MultipartOptions, MultipartUpload, PutOptions, PutOutcome, MAX_PARTS,
+    MIN_PART_SIZE,
 };
 
 impl R2Client {
     /// Uploads a local file, choosing single-shot or multipart automatically.
     ///
-    /// Files below [`DEFAULT_MULTIPART_THRESHOLD`] are sent in one request;
-    /// larger ones are split into concurrent parts. Either way the body is
-    /// streamed from disk rather than buffered in memory.
+    /// Files below [`DEFAULT_MULTIPART_THRESHOLD`](crate::DEFAULT_MULTIPART_THRESHOLD)
+    /// are sent in one request; larger ones are split into concurrent parts.
+    /// Either way the body is streamed from disk rather than buffered in
+    /// memory.
     pub async fn upload_file(&self, key: &str, path: &Path) -> Result<PutOutcome> {
         self.upload_file_with(key, path, MultipartOptions::new())
             .await
@@ -34,11 +36,11 @@ impl R2Client {
     ) -> Result<PutOutcome> {
         validate_key(key)?;
 
-        let size = tokio::fs::metadata(path).await?.len();
-        if size < DEFAULT_MULTIPART_THRESHOLD {
-            let body = ByteStream::from_path(path)
-                .await
-                .map_err(|err| Error::Body(Box::new(err)))?;
+        let size = file_size(path).await?;
+        if size < options.threshold {
+            let body = ByteStream::from_path(path).await.map_err(|err| {
+                Error::file(path, "could not open the file for upload", Some(err))
+            })?;
             return self.put_object_with(key, body, options.put_options).await;
         }
 
@@ -47,8 +49,14 @@ impl R2Client {
 
     /// Uploads a local file using multipart regardless of its size.
     ///
-    /// If any part fails the upload is aborted before the error is returned, so
-    /// no incomplete upload is left holding storage.
+    /// Every part is the same size except the last, which is what R2 requires
+    /// of a multipart upload.
+    ///
+    /// If a part fails, the upload is aborted on a best-effort basis before the
+    /// error is returned. Should that abort itself fail — or should the process
+    /// die mid-upload — the incomplete upload keeps holding storage until it is
+    /// cleaned up; [`list_multipart_uploads`](R2Client::list_multipart_uploads)
+    /// finds those, and a lifecycle rule can expire them automatically.
     pub async fn multipart_upload_file(
         &self,
         key: &str,
@@ -64,7 +72,7 @@ impl R2Client {
             ));
         }
 
-        let size = tokio::fs::metadata(path).await?.len();
+        let size = file_size(path).await?;
         if size == 0 {
             return Err(Error::multipart(
                 key,
@@ -138,7 +146,9 @@ impl R2Client {
                         .length(Length::Exact(length))
                         .build()
                         .await
-                        .map_err(|err| Error::Body(Box::new(err)))?;
+                        .map_err(|err| {
+                            Error::file(path, "could not read the part from disk", Some(err))
+                        })?;
 
                     self.upload_part(key, upload_id, part_number, body).await
                 }
@@ -195,13 +205,16 @@ impl R2Client {
     /// Uploads one part of an in-progress multipart upload.
     ///
     /// `part_number` is 1-based. Every part except the last must be at least
-    /// [`MIN_PART_SIZE`] bytes.
+    /// [`MIN_PART_SIZE`] bytes — and R2 is stricter than S3 here: every part
+    /// except the last must also be *exactly the same size*, so pick one part
+    /// size and use it throughout. The higher-level
+    /// [`multipart_upload_file`](R2Client::multipart_upload_file) already does.
     pub async fn upload_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: i32,
-        body: impl Into<ByteStream>,
+        body: impl IntoBody,
     ) -> Result<CompletedPart> {
         if part_number < 1 || part_number as u64 > MAX_PARTS {
             return Err(Error::invalid_argument(
@@ -217,7 +230,7 @@ impl R2Client {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
-            .body(body.into())
+            .body(body.into_body())
             .send()
             .await
             .map_err(|err| from_sdk("upload_part", err))?;
@@ -290,31 +303,64 @@ impl R2Client {
         Ok(())
     }
 
-    /// Lists multipart uploads that were started but never completed.
+    /// Lists multipart uploads that were started but never completed,
+    /// following pagination to the end.
     ///
-    /// Useful for cleaning up storage held by interrupted uploads.
+    /// Useful for cleaning up storage held by interrupted uploads. Note this
+    /// returns uploads started by anyone with access to the bucket, not just
+    /// this process — check the keys before aborting any of them.
     pub async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUpload>> {
-        let response = self
-            .client
-            .list_multipart_uploads()
-            .bucket(&self.bucket)
-            .send()
-            .await
-            .map_err(|err| from_sdk("list_multipart_uploads", err))?;
+        let mut uploads = Vec::new();
+        let mut markers: Option<(String, Option<String>)> = None;
 
-        Ok(response
-            .uploads
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|upload| {
-                Some(MultipartUpload {
-                    key: upload.key?,
-                    upload_id: upload.upload_id?,
-                    initiated: upload.initiated,
-                })
-            })
-            .collect())
+        loop {
+            let mut request = self.client.list_multipart_uploads().bucket(&self.bucket);
+            if let Some((key_marker, upload_id_marker)) = markers {
+                request = request
+                    .key_marker(key_marker)
+                    .set_upload_id_marker(upload_id_marker);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|err| from_sdk("list_multipart_uploads", err))?;
+
+            uploads.extend(
+                response
+                    .uploads
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|upload| {
+                        Some(MultipartUpload {
+                            key: upload.key?,
+                            upload_id: upload.upload_id?,
+                            initiated: upload.initiated,
+                        })
+                    }),
+            );
+
+            // As with object listing, a truncated page without a marker would
+            // otherwise re-read page one forever.
+            match response.next_key_marker {
+                Some(key_marker) if response.is_truncated.unwrap_or(false) => {
+                    markers = Some((key_marker, response.next_upload_id_marker));
+                }
+                _ => break,
+            }
+        }
+
+        Ok(uploads)
     }
+}
+
+/// Reads a local file's size, reporting a missing or unreadable file as
+/// [`Error::File`] rather than a bare I/O error with no path in it.
+async fn file_size(path: &Path) -> Result<u64> {
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.len())
+        .map_err(|err| Error::file(path, "could not read the file's metadata", Some(err)))
 }
 
 /// Picks a part size that satisfies both the service minimum and the 10,000

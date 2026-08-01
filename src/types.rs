@@ -49,47 +49,55 @@ pub struct PutOptions {
 
 impl PutOptions {
     /// Creates an empty set of options.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the MIME type explicitly instead of guessing from the key.
+    #[must_use]
     pub fn content_type(mut self, value: impl Into<String>) -> Self {
         self.content_type = Some(value.into());
         self
     }
 
     /// Sets the `Cache-Control` header.
+    #[must_use]
     pub fn cache_control(mut self, value: impl Into<String>) -> Self {
         self.cache_control = Some(value.into());
         self
     }
 
     /// Sets the `Content-Disposition` header.
+    #[must_use]
     pub fn content_disposition(mut self, value: impl Into<String>) -> Self {
         self.content_disposition = Some(value.into());
         self
     }
 
     /// Sets the `Content-Encoding` header.
+    #[must_use]
     pub fn content_encoding(mut self, value: impl Into<String>) -> Self {
         self.content_encoding = Some(value.into());
         self
     }
 
     /// Sets the `Content-Language` header.
+    #[must_use]
     pub fn content_language(mut self, value: impl Into<String>) -> Self {
         self.content_language = Some(value.into());
         self
     }
 
     /// Adds a single user metadata entry.
+    #[must_use]
     pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
     }
 
     /// Replaces all user metadata at once.
+    #[must_use]
     pub fn metadata_map(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
         self
@@ -130,35 +138,41 @@ pub struct ListOptions {
 
 impl ListOptions {
     /// Creates an unfiltered listing request.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Restricts the listing to keys starting with `prefix`.
+    #[must_use]
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
         self
     }
 
     /// Groups keys by `delimiter`, returning the groups as common prefixes.
+    #[must_use]
     pub fn delimiter(mut self, delimiter: impl Into<String>) -> Self {
         self.delimiter = Some(delimiter.into());
         self
     }
 
     /// Limits how many keys a single page returns.
+    #[must_use]
     pub fn max_keys(mut self, max_keys: i32) -> Self {
         self.max_keys = Some(max_keys);
         self
     }
 
     /// Starts the listing after the given key.
+    #[must_use]
     pub fn start_after(mut self, key: impl Into<String>) -> Self {
         self.start_after = Some(key.into());
         self
     }
 
     /// Continues a previous listing.
+    #[must_use]
     pub fn continuation_token(mut self, token: impl Into<String>) -> Self {
         self.continuation_token = Some(token.into());
         self
@@ -167,6 +181,7 @@ impl ListOptions {
 
 /// One object as returned by a listing.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ObjectSummary {
     /// The object's key.
     pub key: String,
@@ -180,6 +195,7 @@ pub struct ObjectSummary {
 
 /// A single page of a listing.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ListPage {
     /// Objects on this page.
     pub objects: Vec<ObjectSummary>,
@@ -193,6 +209,7 @@ pub struct ListPage {
 
 /// Full metadata for a single object, as returned by `HEAD`.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ObjectMetadata {
     /// Size in bytes.
     pub content_length: i64,
@@ -216,6 +233,7 @@ pub struct ObjectMetadata {
 
 /// Result of storing an object.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PutOutcome {
     /// The key that was written.
     pub key: String,
@@ -225,6 +243,7 @@ pub struct PutOutcome {
 
 /// One key that could not be deleted in a batch delete.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DeleteFailure {
     /// The key that survived.
     pub key: String,
@@ -237,6 +256,7 @@ pub struct DeleteFailure {
 /// Outcome of a batch delete. R2 reports per-key failures rather than failing
 /// the whole request, so both lists can be non-empty at once.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DeleteReport {
     /// Keys that were removed.
     pub deleted: Vec<String>,
@@ -253,6 +273,7 @@ impl DeleteReport {
 
 /// A bucket owned by the account.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BucketSummary {
     /// Bucket name.
     pub name: String,
@@ -275,6 +296,10 @@ pub struct MultipartOptions {
     pub part_size: u64,
     /// How many parts to upload at once.
     pub concurrency: usize,
+    /// Files at or above this size go through multipart; smaller ones are sent
+    /// in a single request. Only consulted by
+    /// [`upload_file_with`](crate::R2Client::upload_file_with).
+    pub threshold: u64,
     /// Headers and user metadata for the finished object.
     pub put_options: PutOptions,
 }
@@ -284,6 +309,7 @@ impl Default for MultipartOptions {
         MultipartOptions {
             part_size: DEFAULT_PART_SIZE,
             concurrency: 8,
+            threshold: DEFAULT_MULTIPART_THRESHOLD,
             put_options: PutOptions::default(),
         }
     }
@@ -291,23 +317,34 @@ impl Default for MultipartOptions {
 
 impl MultipartOptions {
     /// Creates options with the default part size and concurrency.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the bytes per part.
+    #[must_use]
     pub fn part_size(mut self, part_size: u64) -> Self {
         self.part_size = part_size;
         self
     }
 
     /// Sets how many parts upload concurrently.
+    #[must_use]
     pub fn concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency;
         self
     }
 
+    /// Sets the file size at which `upload_file_with` switches to multipart.
+    #[must_use]
+    pub fn threshold(mut self, threshold: u64) -> Self {
+        self.threshold = threshold;
+        self
+    }
+
     /// Sets the headers and user metadata for the finished object.
+    #[must_use]
     pub fn put_options(mut self, put_options: PutOptions) -> Self {
         self.put_options = put_options;
         self
@@ -316,6 +353,7 @@ impl MultipartOptions {
 
 /// An in-progress multipart upload.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MultipartUpload {
     /// Key being uploaded to.
     pub key: String,
@@ -327,6 +365,7 @@ pub struct MultipartUpload {
 
 /// A part that has been uploaded and is ready to be completed.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CompletedPart {
     /// 1-based part number.
     pub part_number: i32,
@@ -363,17 +402,20 @@ impl Default for PresignOptions {
 
 impl PresignOptions {
     /// Creates options valid for one hour.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets how long the URL stays valid.
+    #[must_use]
     pub fn expires_in(mut self, expires_in: Duration) -> Self {
         self.expires_in = expires_in;
         self
     }
 
     /// Overrides the `Content-Type` served with the download.
+    #[must_use]
     pub fn response_content_type(mut self, value: impl Into<String>) -> Self {
         self.response_content_type = Some(value.into());
         self
@@ -381,12 +423,14 @@ impl PresignOptions {
 
     /// Overrides the `Content-Disposition` served with the download, e.g.
     /// `attachment; filename="invoice.pdf"`.
+    #[must_use]
     pub fn response_content_disposition(mut self, value: impl Into<String>) -> Self {
         self.response_content_disposition = Some(value.into());
         self
     }
 
     /// Requires the uploading client to send this `Content-Type`.
+    #[must_use]
     pub fn content_type(mut self, value: impl Into<String>) -> Self {
         self.content_type = Some(value.into());
         self

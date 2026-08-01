@@ -21,7 +21,7 @@
 //!         .secret_access_key("secret-key")
 //!         .build()?;
 //!
-//!     client.put_object("hello.txt", b"hello world".to_vec()).await?;
+//!     client.put_object("hello.txt", "hello world").await?;
 //!     let body = client.get_object("hello.txt").await?;
 //!     assert_eq!(body, b"hello world");
 //!     Ok(())
@@ -84,6 +84,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+mod body;
 mod client;
 mod config;
 mod error;
@@ -92,6 +93,7 @@ mod object;
 mod presign;
 mod types;
 
+pub use body::IntoBody;
 pub use client::{
     HasAccessKey, HasBucket, HasEndpoint, HasSecretKey, NoAccessKey, NoBucket, NoEndpoint,
     NoSecretKey, R2Client, R2ClientBuilder,
@@ -111,6 +113,8 @@ pub use types::{
 /// CORS and lifecycle rules are deep, rarely-touched structures, so rather than
 /// mirror them this crate takes the SDK's own types directly.
 pub mod s3 {
+    pub use aws_sdk_s3::config::retry::RetryConfig;
+    pub use aws_sdk_s3::config::timeout::TimeoutConfig;
     pub use aws_sdk_s3::primitives::ByteStream;
     pub use aws_sdk_s3::types::{
         CorsRule, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,

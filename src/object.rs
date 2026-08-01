@@ -1,11 +1,13 @@
 //! Object-level operations: put, get, head, copy, delete, list and download.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use tokio::io::AsyncWriteExt;
 
+use crate::body::IntoBody;
 use crate::client::R2Client;
 use crate::error::{from_sdk, Error, Result};
 use crate::types::{
@@ -16,10 +18,17 @@ use crate::types::{
 impl R2Client {
     /// Stores an object, guessing its content type from the key's extension.
     ///
-    /// The body can be anything convertible into a [`ByteStream`], which
-    /// includes `Vec<u8>` and `bytes::Bytes`. To stream from disk without
+    /// The body can be a string, a byte slice or array, a `Vec<u8>`, `Bytes`,
+    /// or a [`ByteStream`] — see [`IntoBody`]. To stream from disk without
     /// buffering the whole file, use [`upload_file`](R2Client::upload_file).
-    pub async fn put_object(&self, key: &str, body: impl Into<ByteStream>) -> Result<PutOutcome> {
+    ///
+    /// ```no_run
+    /// # async fn run(client: cloudflare_r2_rs::R2Client) -> cloudflare_r2_rs::Result<()> {
+    /// client.put_object("notes/hello.txt", "hello world").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn put_object(&self, key: &str, body: impl IntoBody) -> Result<PutOutcome> {
         self.put_object_with(key, body, PutOptions::new()).await
     }
 
@@ -27,7 +36,7 @@ impl R2Client {
     pub async fn put_object_with(
         &self,
         key: &str,
-        body: impl Into<ByteStream>,
+        body: impl IntoBody,
         options: PutOptions,
     ) -> Result<PutOutcome> {
         validate_key(key)?;
@@ -37,7 +46,7 @@ impl R2Client {
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(body.into())
+            .body(body.into_body())
             .content_type(options.resolved_content_type(key))
             .set_cache_control(options.cache_control.clone())
             .set_content_disposition(options.content_disposition.clone())
@@ -157,6 +166,8 @@ impl R2Client {
     }
 
     /// Reports whether an object exists.
+    ///
+    /// A permission failure is an error, not `false`.
     pub async fn object_exists(&self, key: &str) -> Result<bool> {
         match self.head_object(key).await {
             Ok(_) => Ok(true),
@@ -220,8 +231,10 @@ impl R2Client {
     /// Deletes many objects, batching into requests of
     /// [`MAX_DELETE_BATCH`] keys.
     ///
-    /// Per-key failures are reported in the returned [`DeleteReport`] rather
-    /// than aborting the whole operation; check
+    /// Every key is validated before the first request goes out, so an invalid
+    /// key never leaves a partially-applied delete behind. Per-key failures
+    /// reported by the service are collected in the returned [`DeleteReport`]
+    /// rather than aborting the remaining batches; check
     /// [`all_succeeded`](DeleteReport::all_succeeded).
     pub async fn delete_objects<I, K>(&self, keys: I) -> Result<DeleteReport>
     where
@@ -229,12 +242,18 @@ impl R2Client {
         K: Into<String>,
     {
         let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
+
+        // Validate everything up front: a bad key in batch three must not
+        // leave batches one and two irreversibly deleted.
+        for key in &keys {
+            validate_key(key)?;
+        }
+
         let mut report = DeleteReport::default();
 
         for batch in keys.chunks(MAX_DELETE_BATCH) {
             let mut identifiers = Vec::with_capacity(batch.len());
             for key in batch {
-                validate_key(key)?;
                 identifiers.push(
                     ObjectIdentifier::builder()
                         .key(key)
@@ -414,6 +433,13 @@ impl R2Client {
     ///
     /// A key of `photos/2024/cat.png` lands at `<directory>/photos/2024/cat.png`,
     /// creating intermediate directories as needed. Returns the written path.
+    ///
+    /// The key is treated as untrusted: anything that would resolve outside
+    /// `directory` — an absolute key, a `..` segment, a Windows drive prefix,
+    /// or a backslash that would be a separator on Windows — is rejected with
+    /// [`Error::InvalidArgument`]. Such keys are legal in R2, so use
+    /// [`download_to`](R2Client::download_to) with an explicit destination if
+    /// you need to fetch one.
     pub async fn download_file(&self, key: &str, directory: &Path) -> Result<PathBuf> {
         validate_key(key)?;
 
@@ -424,7 +450,7 @@ impl R2Client {
             ));
         }
 
-        let destination = directory.join(key);
+        let destination = safe_join(directory, key)?;
         self.download_to(key, &destination).await?;
         Ok(destination)
     }
@@ -432,7 +458,13 @@ impl R2Client {
     /// Downloads an object to an exact path, streaming it to disk.
     ///
     /// Creates parent directories as needed and returns the number of bytes
-    /// written.
+    /// written. The download lands atomically: bytes go to a temporary file
+    /// beside the destination and are renamed into place only once the whole
+    /// body has arrived, so an interrupted transfer never leaves a truncated
+    /// file where a complete one is expected.
+    ///
+    /// The destination is used exactly as given; it is the caller's path, not
+    /// the object's, so no key-derived traversal is possible here.
     pub async fn download_to(&self, key: &str, destination: &Path) -> Result<u64> {
         validate_key(key)?;
 
@@ -442,20 +474,28 @@ impl R2Client {
             }
         }
 
+        let temporary = temporary_path(destination);
         let mut stream = self.get_object_stream(key).await?;
-        let mut file = tokio::fs::File::create(destination).await?;
-        let mut written = 0u64;
 
-        while let Some(chunk) = stream
-            .try_next()
-            .await
-            .map_err(|err| Error::Body(Box::new(err)))?
-        {
-            file.write_all(&chunk).await?;
-            written += chunk.len() as u64;
+        let written = match stream_to_file(&mut stream, &temporary).await {
+            Ok(written) => written,
+            Err(err) => {
+                // Best effort: leaving the partial file behind would be worse
+                // than losing the (already reported) cleanup failure.
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = tokio::fs::rename(&temporary, destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(Error::file(
+                destination,
+                "could not move the completed download into place",
+                Some(err),
+            ));
         }
 
-        file.flush().await?;
         Ok(written)
     }
 
@@ -482,23 +522,108 @@ impl R2Client {
     }
 }
 
-/// Rejects keys that are empty or that would escape a download directory.
+/// Streams a response body into a file, returning the byte count.
+async fn stream_to_file(stream: &mut ByteStream, path: &Path) -> Result<u64> {
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|err| Error::file(path, "could not create the download file", Some(err)))?;
+    let mut written = 0u64;
+
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|err| Error::Body(Box::new(err)))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| Error::file(path, "could not write the download", Some(err)))?;
+        written += chunk.len() as u64;
+    }
+
+    file.flush()
+        .await
+        .map_err(|err| Error::file(path, "could not flush the download", Some(err)))?;
+    Ok(written)
+}
+
+/// Builds a sibling path for the in-progress download.
+///
+/// Same directory as the destination, so the final rename stays on one
+/// filesystem and is therefore atomic.
+fn temporary_path(destination: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut name = destination
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{unique}.r2partial", std::process::id()));
+
+    match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Validates a key for a *network* operation.
+///
+/// Deliberately permissive: `..`, leading slashes and backslashes are all
+/// legal in an R2 key, and refusing them here would make objects that exist
+/// unreachable. Only genuinely unusable keys are rejected. Filesystem safety
+/// is enforced separately by [`safe_join`], at the point where a key becomes
+/// a path.
 pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(Error::invalid_argument("key", "key must not be empty"));
     }
 
-    if Path::new(key)
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
+    if key.contains('\0') {
         return Err(Error::invalid_argument(
             "key",
-            format!("key `{key}` contains a `..` segment"),
+            "key must not contain a NUL byte",
         ));
     }
 
     Ok(())
+}
+
+/// Joins an untrusted key onto a directory, refusing anything that escapes it.
+pub(crate) fn safe_join(directory: &Path, key: &str) -> Result<PathBuf> {
+    let reject = |reason: &str| {
+        Err(Error::invalid_argument(
+            "key",
+            format!(
+                "key `{key}` cannot be written under a directory: {reason}. \
+                 Use download_to() with an explicit destination path instead."
+            ),
+        ))
+    };
+
+    // A backslash is a path separator on Windows, so a key containing one
+    // would traverse differently depending on the platform. Reject it
+    // everywhere rather than be safe on Linux and exploitable on Windows.
+    if key.contains('\\') {
+        return reject("it contains a backslash");
+    }
+
+    let relative = Path::new(key);
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => return reject("it contains a `..` segment"),
+            Component::RootDir => return reject("it is an absolute path"),
+            Component::Prefix(_) => return reject("it has a filesystem prefix"),
+        }
+    }
+
+    // A key of "." or "./" resolves to the directory itself, not a file.
+    let joined = directory.join(relative);
+    if joined == directory {
+        return reject("it does not name a file");
+    }
+
+    Ok(joined)
 }
 
 /// Percent-encodes a key for use in a `x-amz-copy-source` header.
@@ -528,15 +653,74 @@ mod tests {
     }
 
     #[test]
-    fn rejects_traversal_key() {
-        assert!(validate_key("../../etc/passwd").is_err());
-        assert!(validate_key("a/../../b").is_err());
+    fn rejects_nul_in_key() {
+        assert!(validate_key("a\0b").is_err());
     }
 
     #[test]
-    fn accepts_normal_keys() {
+    fn network_operations_accept_keys_that_look_like_traversal() {
+        // These are legal R2 keys. Refusing them would make real objects
+        // unreachable; only the filesystem join needs to care.
+        assert!(validate_key("../../etc/passwd").is_ok());
+        assert!(validate_key("/leading-slash.txt").is_ok());
+        assert!(validate_key("a/../b").is_ok());
         assert!(validate_key("photos/2024/cat.png").is_ok());
-        assert!(validate_key("file.txt").is_ok());
+    }
+
+    #[test]
+    fn safe_join_accepts_ordinary_keys() {
+        let base = Path::new("/tmp/dl");
+        assert_eq!(
+            safe_join(base, "photos/2024/cat.png").unwrap(),
+            base.join("photos/2024/cat.png")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_segments() {
+        assert!(safe_join(Path::new("/tmp/dl"), "../escape.txt").is_err());
+        assert!(safe_join(Path::new("/tmp/dl"), "a/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_keys() {
+        // Path::join would silently discard the base directory here.
+        assert!(safe_join(Path::new("/tmp/dl"), "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_backslashes_on_every_platform() {
+        assert!(safe_join(Path::new("/tmp/dl"), "..\\escape.txt").is_err());
+        assert!(safe_join(Path::new("/tmp/dl"), "C:\\Windows\\system32").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_keys_that_name_no_file() {
+        assert!(safe_join(Path::new("/tmp/dl"), ".").is_err());
+        assert!(safe_join(Path::new("/tmp/dl"), "./").is_err());
+    }
+
+    #[test]
+    fn safe_join_keeps_the_result_under_the_directory() {
+        let base = Path::new("/tmp/dl");
+        for key in ["a.txt", "a/b/c.txt", "./a.txt"] {
+            let joined = safe_join(base, key).unwrap();
+            assert!(joined.starts_with(base), "{key} escaped to {joined:?}");
+        }
+    }
+
+    #[test]
+    fn temporary_path_is_a_sibling_of_the_destination() {
+        let temporary = temporary_path(Path::new("/tmp/dl/file.bin"));
+        assert_eq!(temporary.parent(), Some(Path::new("/tmp/dl")));
+        assert_ne!(temporary, PathBuf::from("/tmp/dl/file.bin"));
+        assert!(temporary.to_string_lossy().starts_with("/tmp/dl/file.bin."));
+    }
+
+    #[test]
+    fn temporary_paths_are_unique() {
+        let destination = Path::new("/tmp/dl/file.bin");
+        assert_ne!(temporary_path(destination), temporary_path(destination));
     }
 
     #[test]

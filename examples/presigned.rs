@@ -10,9 +10,12 @@ use cloudflare_r2_rs::{PresignOptions, R2Client, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     let client = R2Client::from_env()?;
+
+    // Presigning is purely local signing — no request is sent and no object
+    // needs to exist, so this example writes nothing to your bucket.
 
     // A URL a browser can upload straight to, no credentials involved.
     let upload = client

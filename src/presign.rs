@@ -163,12 +163,13 @@ impl R2Client {
 
 fn presign_error<E>(operation: &'static str, key: &str, err: E) -> Error
 where
-    E: std::error::Error,
+    E: std::error::Error + Send + Sync + 'static,
 {
     Error::Presigning {
         operation,
         key: key.to_string(),
-        message: err.to_string(),
+        message: crate::error::best_message(&err),
+        source: Some(Box::new(err)),
     }
 }
 
@@ -182,6 +183,7 @@ fn presigning_config(
             operation,
             key: key.to_string(),
             message: "expiry must be greater than zero".to_string(),
+            source: None,
         });
     }
 
@@ -194,6 +196,7 @@ fn presigning_config(
                 expires_in.as_secs(),
                 MAX_PRESIGN_EXPIRY.as_secs()
             ),
+            source: None,
         });
     }
 
@@ -201,6 +204,7 @@ fn presigning_config(
         operation,
         key: key.to_string(),
         message: err.to_string(),
+        source: Some(Box::new(err)),
     })
 }
 

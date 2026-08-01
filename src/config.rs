@@ -67,7 +67,12 @@ pub fn endpoint_for_account(account_id: &str, jurisdiction: Jurisdiction) -> Str
 }
 
 /// Fully resolved configuration for an [`R2Client`](crate::R2Client).
-#[derive(Debug, Clone)]
+///
+/// `Debug` deliberately redacts [`secret_access_key`](R2Config::secret_access_key):
+/// configuration structs end up in tracing spans and panic messages, and a
+/// live credential must not ride along. Read the field directly if you
+/// genuinely need its value.
+#[derive(Clone)]
 pub struct R2Config {
     /// S3-compatible endpoint URL.
     pub endpoint: String,
@@ -81,6 +86,18 @@ pub struct R2Config {
     pub region: String,
 }
 
+impl std::fmt::Debug for R2Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("R2Config")
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .finish()
+    }
+}
+
 impl R2Config {
     /// Reads configuration from the process environment.
     ///
@@ -89,7 +106,11 @@ impl R2Config {
     /// - `R2_ACCESS_KEY_ID` (or `CLOUDFLARE_CLIENT_ID`)
     /// - `R2_SECRET_ACCESS_KEY` (or `CLOUDFLARE_SECRET_KEY`)
     /// - `R2_BUCKET` (or `CLOUDFLARE_BUCKET_NAME`)
-    /// - either `R2_ACCOUNT_ID` or an explicit `R2_ENDPOINT` (or `CLOUDFLARE_URL`)
+    /// - `R2_ENDPOINT` (or `CLOUDFLARE_URL`), otherwise `R2_ACCOUNT_ID` (or
+    ///   `CLOUDFLARE_ACCOUNT_ID`), from which the endpoint is derived
+    ///
+    /// An explicit endpoint takes precedence: if both are set, `R2_ACCOUNT_ID`
+    /// and `R2_JURISDICTION` are ignored.
     ///
     /// Optional variables: `R2_JURISDICTION` (`default`, `eu`, `fedramp`) and
     /// `R2_REGION`.
@@ -138,6 +159,23 @@ fn env_any(names: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_the_secret_key() {
+        let config = R2Config {
+            endpoint: "https://acct.r2.cloudflarestorage.com".into(),
+            access_key_id: "public-id".into(),
+            secret_access_key: "super-secret-value".into(),
+            bucket: "bucket".into(),
+            region: "auto".into(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("super-secret-value"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The non-sensitive fields are still useful for debugging.
+        assert!(rendered.contains("public-id"));
+        assert!(rendered.contains("bucket"));
+    }
 
     #[test]
     fn builds_default_endpoint() {

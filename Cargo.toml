@@ -12,10 +12,12 @@ documentation = "https://docs.rs/cloudflare-r2-rs"
 readme = "README.md"
 keywords = ["cloudflare", "r2", "s3", "storage", "sdk"]
 categories = ["api-bindings", "web-programming", "filesystem"]
-exclude = ["/.github", "/examples"]
+# examples/ ships with the crate: the README points readers at them.
+exclude = ["/.github", "/.env.example"]
 
 [dependencies]
 aws-sdk-s3 = { version = "1.140", features = ["behavior-version-latest"] }
+bytes = "1.7"
 tokio = { version = "1.0.0", features = ["rt", "macros", "fs", "io-util", "sync"] }
 futures = "0.3.30"
 mime_guess = "2.0.4"
@@ -23,6 +25,12 @@ thiserror = "1.0.63"
 log = "0.4.21"
 
 [dev-dependencies]
-tokio = { version = "1.0.0", features = ["rt-multi-thread", "macros", "fs"] }
-dotenv = "0.15.0"
+tokio = { version = "1.0.0", features = ["rt-multi-thread", "macros", "fs", "net", "io-util"] }
+# dotenv 0.15 is unmaintained (RUSTSEC-2021-0141); dotenvy is its maintained fork.
+dotenvy = "0.15"
 tempfile = "3.10"
+bytes = "1.7"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

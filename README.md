@@ -329,5 +329,4 @@ checked — the dependency version in particular is maintained by hand.
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+[MIT](LICENSE).

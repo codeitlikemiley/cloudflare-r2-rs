@@ -48,9 +48,8 @@ backwards compatible with `0.1.0`; see **Migrating** below.
 - Runnable `examples/`, a `.env.example`, an offline test suite — including
   `tests/offline_http.rs`, which runs the client against a local mock endpoint
   to cover wire format, pagination, batching and error mapping — plus
-  `#[ignore]`d live tests. A GitHub Actions workflow is included at
-  `.github/workflows-disabled/ci.yml`; move it to `.github/workflows/` to
-  activate it.
+  `#[ignore]`d live tests, and a GitHub Actions workflow running fmt, clippy,
+  build, test, doc and `cargo package`.
 
 ### Changed
 

@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(collect(*b"hi").await, b"hi");
         assert_eq!(collect(vec![b'h', b'i']).await, b"hi");
         assert_eq!(collect(&vec![b'h', b'i']).await, b"hi");
-        assert_eq!(collect([b'h', b'i'].as_slice()).await, b"hi");
+        assert_eq!(collect(b"hi".as_slice()).await, b"hi");
         assert_eq!(collect(bytes::Bytes::from_static(b"hi")).await, b"hi");
         assert_eq!(collect(ByteStream::from_static(b"hi")).await, b"hi");
         assert_eq!(collect(&String::from("hi")).await, b"hi");

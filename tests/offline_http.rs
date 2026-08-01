@@ -735,6 +735,109 @@ async fn download_file_mirrors_the_key_under_the_directory() {
 }
 
 #[tokio::test]
+async fn download_to_refuses_a_directory_destination_before_transferring() {
+    let mock = MockR2::start(vec![Canned::ok("body")]).await;
+    let directory = tempfile::tempdir().unwrap();
+
+    let err = mock
+        .client()
+        .download_to("a.txt", directory.path())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+    assert!(
+        mock.requests().is_empty(),
+        "the body was transferred before the destination was checked"
+    );
+}
+
+#[tokio::test]
+async fn a_long_key_can_still_be_downloaded() {
+    // 250 bytes: a legal key and a legal filename. The temporary file used for
+    // the atomic write must not push it past the 255-byte name limit.
+    let long_name = "n".repeat(250);
+    let mock = MockR2::start(vec![Canned::ok("body")]).await;
+    let directory = tempfile::tempdir().unwrap();
+
+    let written = mock
+        .client()
+        .download_file(&long_name, directory.path())
+        .await
+        .unwrap();
+
+    assert_eq!(tokio::fs::read_to_string(&written).await.unwrap(), "body");
+}
+
+#[tokio::test]
+async fn a_missing_copy_source_names_the_source_bucket() {
+    let mock = MockR2::start(vec![Canned::error(404, "NoSuchKey", "gone")]).await;
+
+    let err = mock
+        .client()
+        .copy_object_from("other-bucket", "src.txt", "dest.txt")
+        .await
+        .unwrap_err();
+
+    match err {
+        Error::ObjectNotFound { bucket, key } => {
+            assert_eq!(bucket, "other-bucket", "named the wrong bucket");
+            assert_eq!(key, "src.txt");
+        }
+        other => panic!("expected ObjectNotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unparseable_error_body_still_yields_an_actionable_message() {
+    // A 5xx whose body is not S3 XML: the SDK chain bottoms out in a bare
+    // "Error", so the status is what makes the failure actionable.
+    let mock = MockR2::start(vec![Canned {
+        status: 502,
+        body: "<html>502 Bad Gateway</html>".to_string(),
+    }])
+    .await;
+
+    let err = mock.client().put_object("a.txt", "x").await.unwrap_err();
+    let rendered = err.to_string();
+
+    assert_eq!(err.status(), Some(502));
+    assert!(rendered.contains("502"), "no status in message: {rendered}");
+    assert!(
+        rendered.contains("put_object"),
+        "no operation in message: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_part_can_be_rebuilt_and_completed() {
+    // The resume-across-processes path: part numbers and ETags come back from
+    // storage rather than from upload_part.
+    let mock = MockR2::start(vec![Canned::ok(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult><ETag>&quot;final&quot;</ETag></CompleteMultipartUploadResult>"#,
+    )])
+    .await;
+
+    let parts = vec![
+        cloudflare_r2_rs::CompletedPart::new(1, "\"etag-1\""),
+        cloudflare_r2_rs::CompletedPart::new(2, "\"etag-2\""),
+    ];
+
+    let outcome = mock
+        .client()
+        .complete_multipart_upload("big.bin", "upload-1", parts)
+        .await
+        .unwrap();
+    assert_eq!(outcome.key, "big.bin");
+
+    let request = mock.first();
+    let body = String::from_utf8_lossy(&request.body);
+    assert!(body.contains("<PartNumber>1</PartNumber>"), "{body}");
+    assert!(body.contains("<PartNumber>2</PartNumber>"), "{body}");
+}
+
+#[tokio::test]
 async fn download_file_refuses_a_key_that_would_escape_the_directory() {
     let mock = MockR2::start(vec![Canned::ok("body")]).await;
     let directory = tempfile::tempdir().unwrap();

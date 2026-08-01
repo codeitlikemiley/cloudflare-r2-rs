@@ -56,7 +56,8 @@ pub enum Error {
     /// transport produced; the full `SdkError` remains reachable as this
     /// error's [`source`](std::error::Error::source), and can be downcast when
     /// you need the typed service error.
-    #[error("R2 operation `{operation}` failed: {message}")]
+    #[error("R2 operation `{operation}` failed{}: {message}",
+        status.map(|status| format!(" (HTTP {status})")).unwrap_or_default())]
     Api {
         /// The logical operation that failed, e.g. `put_object`.
         operation: &'static str,
@@ -184,27 +185,52 @@ where
     }
 }
 
+/// Messages that carry no information, at any depth in an SDK error chain.
+///
+/// The SDK uses these as structural placeholders — a service failure with no
+/// parseable body bottoms out in a bare "Error" — so taking the deepest message
+/// blindly can be strictly worse than taking a shallower one.
+const PLACEHOLDER_MESSAGES: &[&str] = &[
+    "error",
+    "unhandled error",
+    "service error",
+    "unhandled error (error)",
+];
+
 /// Picks the most informative message from an error chain.
 ///
 /// `SdkError`'s own `Display` is famously terse — a service failure renders as
 /// just "service error" — while the useful text sits further down the chain.
-/// The deepest message is therefore the one worth surfacing. It is not
-/// concatenated with its ancestors, because the whole chain stays reachable
-/// through [`Error::Api`]'s `source` and printing it in both places would
-/// duplicate it for anyone walking the chain.
+/// The deepest *informative* message is therefore the one worth surfacing;
+/// placeholders are skipped so a response the SDK could not parse does not
+/// reduce the whole error to the word "Error".
+///
+/// The chosen message is not concatenated with its ancestors, because the whole
+/// chain stays reachable through [`Error::Api`]'s `source` and printing it in
+/// both places would duplicate it for anyone walking the chain.
 pub(crate) fn best_message(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut best = err.to_string();
+    fn informative(text: &str) -> bool {
+        let normalized = text.trim().to_ascii_lowercase();
+        !normalized.is_empty() && !PLACEHOLDER_MESSAGES.contains(&normalized.as_str())
+    }
+
+    let top = err.to_string();
+    let mut best: Option<String> = informative(&top).then(|| top.clone());
     let mut source = err.source();
+
     // Bounded so a pathological (or cyclic) chain cannot spin here.
     for _ in 0..32 {
         let Some(cause) = source else { break };
         let text = cause.to_string();
-        if !text.is_empty() {
-            best = text;
+        if informative(&text) {
+            best = Some(text);
         }
         source = cause.source();
     }
-    best
+
+    // Every level was a placeholder: the top-level text is no worse than the
+    // bottom one, and `Error::Api` still prints the HTTP status alongside it.
+    best.unwrap_or(top)
 }
 
 #[cfg(test)]
@@ -253,6 +279,53 @@ mod tests {
             source: None,
         };
         assert_eq!(best_message(&err), "dispatch failure");
+    }
+
+    #[test]
+    fn best_message_skips_placeholder_causes() {
+        // The shape a 5xx with an unparseable body produces: the deepest link
+        // is a bare "Error", and the real information is higher up.
+        let err = Layer {
+            message: "service error",
+            source: Some(Box::new(Layer {
+                message: "Bad Gateway from upstream",
+                source: Some(Box::new(Layer {
+                    message: "Error",
+                    source: None,
+                })),
+            })),
+        };
+        assert_eq!(best_message(&err), "Bad Gateway from upstream");
+    }
+
+    #[test]
+    fn best_message_falls_back_when_every_level_is_a_placeholder() {
+        let err = Layer {
+            message: "service error",
+            source: Some(Box::new(Layer {
+                message: "Error",
+                source: None,
+            })),
+        };
+        // No information anywhere; the status in `Error::Api`'s Display is what
+        // makes this actionable, so the message must not be empty.
+        assert!(!best_message(&err).is_empty());
+    }
+
+    #[test]
+    fn api_display_includes_the_http_status() {
+        let err = Error::Api {
+            operation: "put_object",
+            message: "Error".into(),
+            status: Some(500),
+            source: Box::new(Layer {
+                message: "Error",
+                source: None,
+            }),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("500"), "{rendered}");
+        assert!(rendered.contains("put_object"), "{rendered}");
     }
 
     #[test]

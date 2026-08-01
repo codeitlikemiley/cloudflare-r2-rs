@@ -37,8 +37,11 @@ backwards compatible with `0.1.0`; see **Migrating** below.
 - **Escape hatch** — `R2Client::inner` exposes the underlying `aws-sdk-s3`
   client.
 - **Body ergonomics** — `IntoBody` lets `put_object` and `upload_part` accept
-  `&str`, `String`, `&[u8]`, byte arrays, `Vec<u8>`, `Bytes` or a `ByteStream`,
-  rather than only the three types `ByteStream` converts from.
+  `&str`, `String`, `&String`, `&[u8]`, `&Vec<u8>`, byte arrays, `Vec<u8>`,
+  `Bytes`, `SdkBody` or a `ByteStream`, rather than only the three types
+  `ByteStream` converts from.
+- `CompletedPart::new` rebuilds a part from a stored part number and ETag, which
+  is what resuming a multipart upload in a later process requires.
 - **Tuning** — `R2ClientBuilder::retry_config` and `timeout_config`, and a
   configurable `MultipartOptions::threshold` for the single-shot/multipart
   cutoff.
@@ -89,7 +92,16 @@ backwards compatible with `0.1.0`; see **Migrating** below.
 - `Error::Api` now carries the most specific message from the SDK error chain
   rather than a concatenation of every level, which had duplicated the chain for
   anything printing `source`.
-- `R2Config`'s `Debug` redacts the secret access key.
+- `R2Config` and `R2ClientBuilder` both redact the secret access key in `Debug`.
+- `Error::Api`'s `Display` includes the HTTP status, and its message skips the
+  SDK's placeholder chain links, so a 5xx whose body is not S3 XML reports
+  `R2 operation \`put_object\` failed (HTTP 502)` rather than the bare word
+  "Error".
+- `download_to` rejects a directory destination before transferring the body,
+  and names the temporary file from the process ID rather than the destination,
+  so a long key cannot exceed the filesystem's 255-byte name limit.
+- `copy_object_from` reports a missing source object against the *source*
+  bucket rather than the destination.
 - The minimum supported Rust version is 1.94.1, required by `aws-sdk-s3`.
   `0.1.0` declared no `rust-version` at all.
 - Output structs (`ObjectSummary`, `ObjectMetadata`, `ListPage`, `PutOutcome`,

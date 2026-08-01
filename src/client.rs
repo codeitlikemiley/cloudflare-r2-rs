@@ -66,7 +66,10 @@ pub struct HasSecretKey;
 ///     .unwrap();
 /// assert_eq!(client.bucket(), "media");
 /// ```
-#[derive(Debug, Default)]
+///
+/// `Debug` redacts the secret access key. The builder is where credentials
+/// enter the crate, and builders end up in tracing spans and panic messages.
+#[derive(Default)]
 pub struct R2ClientBuilder<EndpointState, BucketState, AccessKeyState, SecretKeyState> {
     endpoint: Option<String>,
     account_id: Option<String>,
@@ -81,6 +84,25 @@ pub struct R2ClientBuilder<EndpointState, BucketState, AccessKeyState, SecretKey
     _bucket: PhantomData<BucketState>,
     _access_key: PhantomData<AccessKeyState>,
     _secret_key: PhantomData<SecretKeyState>,
+}
+
+impl<EndpointState, BucketState, AccessKeyState, SecretKeyState> std::fmt::Debug
+    for R2ClientBuilder<EndpointState, BucketState, AccessKeyState, SecretKeyState>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("R2ClientBuilder")
+            .field("endpoint", &self.endpoint)
+            .field("account_id", &self.account_id)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("region", &self.region)
+            .field("jurisdiction", &self.jurisdiction)
+            .finish_non_exhaustive()
+    }
 }
 
 impl R2ClientBuilder<NoEndpoint, NoBucket, NoAccessKey, NoSecretKey> {
@@ -509,7 +531,10 @@ impl R2Client {
             .bucket(&self.bucket)
             .send()
             .await
-            .map_err(|err| self.map_bucket_error("delete_bucket_cors", err))?;
+            // Deliberately not map_bucket_error: a 404 here can mean "no CORS
+            // configuration to delete" as well as "no such bucket", and
+            // guessing which would repeat the conflation get_cors avoids.
+            .map_err(|err| from_sdk("delete_bucket_cors", err))?;
         Ok(())
     }
 
@@ -566,7 +591,8 @@ impl R2Client {
             .bucket(&self.bucket)
             .send()
             .await
-            .map_err(|err| self.map_bucket_error("delete_bucket_lifecycle", err))?;
+            // See delete_cors: a 404 is ambiguous here.
+            .map_err(|err| from_sdk("delete_bucket_lifecycle", err))?;
         Ok(())
     }
 }
@@ -583,6 +609,19 @@ mod tests {
             .secret_access_key("secret")
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn builder_debug_redacts_the_secret_key() {
+        let builder = R2Client::builder()
+            .account_id("acct")
+            .bucket("bucket")
+            .access_key_id("AKIAPUBLIC")
+            .secret_access_key("super-secret-value");
+        let rendered = format!("{builder:?}");
+        assert!(!rendered.contains("super-secret-value"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("AKIAPUBLIC"));
     }
 
     #[test]

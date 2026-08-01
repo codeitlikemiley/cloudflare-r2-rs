@@ -364,13 +364,31 @@ pub struct MultipartUpload {
 }
 
 /// A part that has been uploaded and is ready to be completed.
-#[derive(Debug, Clone)]
+///
+/// Usually obtained from [`upload_part`](crate::R2Client::upload_part), but it
+/// is also an *input* to
+/// [`complete_multipart_upload`](crate::R2Client::complete_multipart_upload) —
+/// so [`new`](CompletedPart::new) exists to rebuild one from a part number and
+/// ETag persisted elsewhere, which is what resuming an upload across processes
+/// requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CompletedPart {
     /// 1-based part number.
     pub part_number: i32,
     /// Entity tag returned when the part was uploaded.
     pub etag: String,
+}
+
+impl CompletedPart {
+    /// Rebuilds a completed part from a stored part number and ETag.
+    #[must_use]
+    pub fn new(part_number: i32, etag: impl Into<String>) -> Self {
+        CompletedPart {
+            part_number,
+            etag: etag.into(),
+        }
+    }
 }
 
 /// Extra parameters for a presigned URL.

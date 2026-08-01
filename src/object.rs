@@ -208,7 +208,19 @@ impl R2Client {
             .copy_source(copy_source)
             .send()
             .await
-            .map_err(|err| self.map_object_error("copy_object", source_key, err))?;
+            .map_err(|err| {
+                let err = from_sdk("copy_object", err);
+                if err.is_not_found() {
+                    // The missing object is the source, which may well live in
+                    // another bucket; naming this one would be wrong.
+                    Error::ObjectNotFound {
+                        bucket: source_bucket.to_string(),
+                        key: source_key.to_string(),
+                    }
+                } else {
+                    err
+                }
+            })?;
         Ok(())
     }
 
@@ -468,9 +480,23 @@ impl R2Client {
     pub async fn download_to(&self, key: &str, destination: &Path) -> Result<u64> {
         validate_key(key)?;
 
+        // Checked before the transfer, not after: discovering this by failing
+        // to create the file would mean pulling the whole body down first.
+        if destination.is_dir() {
+            return Err(Error::invalid_argument(
+                "destination",
+                format!(
+                    "{} is a directory; pass the full file path to write",
+                    destination.display()
+                ),
+            ));
+        }
+
         if let Some(parent) = destination.parent() {
             if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
+                tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                    Error::file(parent, "could not create the parent directory", Some(err))
+                })?;
             }
         }
 
@@ -550,15 +576,15 @@ async fn stream_to_file(stream: &mut ByteStream, path: &Path) -> Result<u64> {
 ///
 /// Same directory as the destination, so the final rename stays on one
 /// filesystem and is therefore atomic.
+///
+/// The name is built from the process ID and a counter rather than from the
+/// destination's file name: most filesystems cap a single name at 255 bytes,
+/// and appending a suffix to an already-long key segment would fail with
+/// `ENAMETOOLONG` on keys that are otherwise perfectly valid.
 fn temporary_path(destination: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    let mut name = destination
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_default();
-    name.push(format!(".{}.{unique}.r2partial", std::process::id()));
+    let name = format!(".r2partial.{}.{unique}", std::process::id());
 
     match destination.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
@@ -714,7 +740,16 @@ mod tests {
         let temporary = temporary_path(Path::new("/tmp/dl/file.bin"));
         assert_eq!(temporary.parent(), Some(Path::new("/tmp/dl")));
         assert_ne!(temporary, PathBuf::from("/tmp/dl/file.bin"));
-        assert!(temporary.to_string_lossy().starts_with("/tmp/dl/file.bin."));
+    }
+
+    #[test]
+    fn temporary_path_stays_within_the_filename_length_limit() {
+        // A 250-byte final segment is a legal key and a legal filename; the
+        // temporary name must not push it over the 255-byte cap.
+        let long = "n".repeat(250);
+        let temporary = temporary_path(Path::new(&format!("/tmp/dl/{long}")));
+        let name = temporary.file_name().unwrap().len();
+        assert!(name <= 255, "temporary file name was {name} bytes");
     }
 
     #[test]

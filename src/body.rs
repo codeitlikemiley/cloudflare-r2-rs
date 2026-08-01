@@ -1,6 +1,6 @@
 //! Conversion of everyday Rust byte containers into request bodies.
 
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 
 /// Anything that can be uploaded as an object body.
 ///
@@ -23,6 +23,7 @@ use aws_sdk_s3::primitives::ByteStream;
 /// let _ = b"hello".into_body();
 /// let _ = vec![1u8, 2, 3].into_body();
 /// let _ = [1u8, 2, 3].as_slice().into_body();
+/// let _ = (&String::from("hello")).into_body();
 /// ```
 pub trait IntoBody {
     /// Converts `self` into a request body.
@@ -56,6 +57,18 @@ impl IntoBody for &[u8] {
 impl IntoBody for &Vec<u8> {
     fn into_body(self) -> ByteStream {
         ByteStream::from(self.clone())
+    }
+}
+
+impl IntoBody for &String {
+    fn into_body(self) -> ByteStream {
+        ByteStream::from(self.as_bytes().to_vec())
+    }
+}
+
+impl IntoBody for SdkBody {
+    fn into_body(self) -> ByteStream {
+        ByteStream::new(self)
     }
 }
 
@@ -113,6 +126,9 @@ mod tests {
         assert_eq!(collect([b'h', b'i'].as_slice()).await, b"hi");
         assert_eq!(collect(bytes::Bytes::from_static(b"hi")).await, b"hi");
         assert_eq!(collect(ByteStream::from_static(b"hi")).await, b"hi");
+        assert_eq!(collect(&String::from("hi")).await, b"hi");
+        // SdkBody kept working when the signature moved off `Into<ByteStream>`.
+        assert_eq!(collect(SdkBody::from("hi")).await, b"hi");
     }
 
     #[tokio::test]

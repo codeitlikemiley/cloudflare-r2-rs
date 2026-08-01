@@ -41,6 +41,10 @@ impl Recorded {
 struct Canned {
     status: u16,
     body: String,
+    /// When set, `Content-Length` advertises this many bytes but only `body` is
+    /// actually written before the socket closes — the shape of a connection
+    /// dropped mid-transfer.
+    declared_length: Option<usize>,
 }
 
 impl Canned {
@@ -48,6 +52,16 @@ impl Canned {
         Canned {
             status: 200,
             body: body.into(),
+            declared_length: None,
+        }
+    }
+
+    /// A response that promises `declared` bytes, sends `body`, then hangs up.
+    fn truncated(body: impl Into<String>, declared: usize) -> Self {
+        Canned {
+            status: 200,
+            body: body.into(),
+            declared_length: Some(declared),
         }
     }
 
@@ -58,6 +72,7 @@ impl Canned {
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <Error><Code>{code}</Code><Message>{message}</Message></Error>"#
             ),
+            declared_length: None,
         }
     }
 }
@@ -176,26 +191,16 @@ async fn read_request(stream: &TcpStream) -> Option<Recorded> {
 
     if let Some(length) = content_length {
         while body.len() < length {
-            stream.readable().await.ok()?;
-            match stream.try_read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => body.extend_from_slice(&chunk[..read]),
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(_) => break,
+            if !read_more(stream, &mut body).await {
+                break;
             }
         }
         body.truncate(length.min(body.len()));
     } else if chunked {
-        // Read until the terminating zero-length chunk.
-        while find(&body, b"\r\n0\r\n").is_none() && !body.starts_with(b"0\r\n") {
-            stream.readable().await.ok()?;
-            match stream.try_read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => body.extend_from_slice(&chunk[..read]),
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(_) => break,
-            }
-        }
+        // Decode the chunk framing rather than scanning for a terminator byte
+        // sequence: payload data can contain "\r\n0\r\n", which would end the
+        // read early and silently drop the rest of the request.
+        body = decode_chunked(stream, body).await;
     }
 
     Some(Recorded {
@@ -206,11 +211,69 @@ async fn read_request(stream: &TcpStream) -> Option<Recorded> {
     })
 }
 
+/// Pulls one more read's worth of bytes into `buffer`. Returns false at EOF.
+async fn read_more(stream: &TcpStream, buffer: &mut Vec<u8>) -> bool {
+    let mut chunk = [0u8; 4096];
+    loop {
+        if stream.readable().await.is_err() {
+            return false;
+        }
+        match stream.try_read(&mut chunk) {
+            Ok(0) => return false,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                return true;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Decodes an HTTP/1.1 chunked body, returning just the payload.
+async fn decode_chunked(stream: &TcpStream, initial: Vec<u8>) -> Vec<u8> {
+    let mut buffer = initial;
+    let mut position = 0usize;
+    let mut payload = Vec::new();
+
+    loop {
+        // Chunk-size line.
+        let line_end = loop {
+            match find(&buffer[position..], b"\r\n") {
+                Some(offset) => break position + offset,
+                None if read_more(stream, &mut buffer).await => continue,
+                None => return payload,
+            }
+        };
+
+        let header = String::from_utf8_lossy(&buffer[position..line_end]).to_string();
+        // Chunk extensions after ';' are not payload.
+        let size =
+            usize::from_str_radix(header.split(';').next().unwrap_or("").trim(), 16).unwrap_or(0);
+        position = line_end + 2;
+
+        if size == 0 {
+            return payload;
+        }
+
+        while buffer.len() < position + size {
+            if !read_more(stream, &mut buffer).await {
+                payload.extend_from_slice(&buffer[position.min(buffer.len())..]);
+                return payload;
+            }
+        }
+
+        payload.extend_from_slice(&buffer[position..position + size]);
+        // Skip the chunk's trailing CRLF.
+        position += size + 2;
+    }
+}
+
 async fn write_response(stream: &TcpStream, canned: &Canned) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: close\r\n\r\n{}",
         canned.status,
-        canned.body.len(),
+        canned.declared_length.unwrap_or(canned.body.len()),
         canned.body
     );
     let mut bytes = response.as_bytes();
@@ -254,6 +317,49 @@ fn list_page(keys: &[&str], next_token: Option<&str>) -> String {
 <IsTruncated>{truncated}</IsTruncated>{token}{contents}</ListBucketResult>"#,
         keys.len()
     )
+}
+
+// --- the harness itself ---------------------------------------------------
+
+/// The mock's chunked-body decoding is dead code today (every request the SDK
+/// makes is Content-Length framed), so it is tested directly. A payload that
+/// contains the chunk terminator byte sequence is the case a naive scan gets
+/// wrong, silently dropping everything after it.
+#[tokio::test]
+async fn the_mock_decodes_chunked_bodies_including_terminator_lookalikes() {
+    use tokio::io::AsyncWriteExt;
+
+    let mock = MockR2::start(vec![Canned::ok("")]).await;
+    let address = mock.endpoint.trim_start_matches("http://").to_string();
+
+    let payload_a = "HELLO";
+    // Payload bytes that look exactly like a chunk terminator.
+    let payload_b = "\r\n0\r\n";
+    let payload_c = "WORLD";
+
+    let request = format!(
+        "PUT /test-bucket/chunked.bin HTTP/1.1\r\nHost: {address}\r\n\
+         Transfer-Encoding: chunked\r\n\r\n\
+         {:X}\r\n{payload_a}\r\n{:X}\r\n{payload_b}\r\n{:X}\r\n{payload_c}\r\n0\r\n\r\n",
+        payload_a.len(),
+        payload_b.len(),
+        payload_c.len(),
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    // Let the server finish recording before the assertion reads it.
+    let mut discard = Vec::new();
+    let _ = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut discard).await;
+
+    let recorded = mock.first();
+    let expected = format!("{payload_a}{payload_b}{payload_c}");
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.body),
+        expected,
+        "chunk framing leaked into the recorded body, or a chunk was dropped"
+    );
 }
 
 // --- wire format -----------------------------------------------------------
@@ -698,7 +804,7 @@ async fn download_to_writes_the_body_and_reports_its_length() {
 }
 
 #[tokio::test]
-async fn a_failed_download_leaves_no_file_behind() {
+async fn a_download_that_404s_creates_no_file() {
     let mock = MockR2::start(vec![Canned::error(404, "NoSuchKey", "gone")]).await;
     let directory = tempfile::tempdir().unwrap();
     let destination = directory.path().join("out.txt");
@@ -709,14 +815,41 @@ async fn a_failed_download_leaves_no_file_behind() {
         .await
         .unwrap_err();
     assert!(err.is_not_found());
+    assert!(!destination.exists());
+}
+
+/// The real test of the atomic-download fix: the failure must happen *after*
+/// bytes have been written, which a 404 never reaches. The server promises 4096
+/// bytes, sends 10, and hangs up.
+#[tokio::test]
+async fn a_download_that_fails_mid_stream_leaves_nothing_behind() {
+    let mock = MockR2::start(vec![Canned::truncated("0123456789", 4096)]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("out.txt");
+
+    let err = mock
+        .client()
+        .download_to("partial.bin", &destination)
+        .await
+        .unwrap_err();
     assert!(
-        !destination.exists(),
-        "a partial file was left at the destination"
+        !err.is_not_found(),
+        "expected a transfer failure, got {err}"
     );
 
-    // And no temporary file was orphaned in the directory either.
+    assert!(
+        !destination.exists(),
+        "a truncated file was left at the destination"
+    );
+
+    // No temporary file orphaned beside it either.
     let mut entries = tokio::fs::read_dir(directory.path()).await.unwrap();
-    assert!(entries.next_entry().await.unwrap().is_none());
+    let leftover = entries.next_entry().await.unwrap();
+    assert!(
+        leftover.is_none(),
+        "orphaned file left behind: {:?}",
+        leftover.map(|entry| entry.file_name())
+    );
 }
 
 #[tokio::test]
@@ -795,6 +928,7 @@ async fn an_unparseable_error_body_still_yields_an_actionable_message() {
     let mock = MockR2::start(vec![Canned {
         status: 502,
         body: "<html>502 Bad Gateway</html>".to_string(),
+        declared_length: None,
     }])
     .await;
 

@@ -1,0 +1,778 @@
+//! Object-level operations: put, get, head, copy, delete, list and download.
+
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use tokio::io::AsyncWriteExt;
+
+use crate::body::IntoBody;
+use crate::client::R2Client;
+use crate::error::{from_sdk, Error, Result};
+use crate::types::{
+    DeleteFailure, DeleteReport, ListOptions, ListPage, ObjectMetadata, ObjectSummary, PutOptions,
+    PutOutcome, MAX_DELETE_BATCH,
+};
+
+impl R2Client {
+    /// Stores an object, guessing its content type from the key's extension.
+    ///
+    /// The body can be a string, a byte slice or array, a `Vec<u8>`, `Bytes`,
+    /// or a [`ByteStream`] — see [`IntoBody`]. To stream from disk without
+    /// buffering the whole file, use [`upload_file`](R2Client::upload_file).
+    ///
+    /// ```no_run
+    /// # async fn run(client: cloudflare_r2_rs::R2Client) -> cloudflare_r2_rs::Result<()> {
+    /// client.put_object("notes/hello.txt", "hello world").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn put_object(&self, key: &str, body: impl IntoBody) -> Result<PutOutcome> {
+        self.put_object_with(key, body, PutOptions::new()).await
+    }
+
+    /// Stores an object with explicit headers and user metadata.
+    pub async fn put_object_with(
+        &self,
+        key: &str,
+        body: impl IntoBody,
+        options: PutOptions,
+    ) -> Result<PutOutcome> {
+        validate_key(key)?;
+
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body.into_body())
+            .content_type(options.resolved_content_type(key))
+            .set_cache_control(options.cache_control.clone())
+            .set_content_disposition(options.content_disposition.clone())
+            .set_content_encoding(options.content_encoding.clone())
+            .set_content_language(options.content_language.clone());
+
+        for (name, value) in &options.metadata {
+            request = request.metadata(name, value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|err| from_sdk("put_object", err))?;
+
+        Ok(PutOutcome {
+            key: key.to_string(),
+            etag: response.e_tag,
+        })
+    }
+
+    /// Fetches an object's full body into memory.
+    ///
+    /// Fails with [`Error::ObjectNotFound`] when the key does not exist.
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
+        let stream = self.get_object_stream(key).await?;
+        let bytes = stream
+            .collect()
+            .await
+            .map_err(|err| Error::Body(Box::new(err)))?;
+        Ok(bytes.into_bytes().to_vec())
+    }
+
+    /// Fetches a byte range of an object, `start` and `end` both inclusive.
+    ///
+    /// Passing `None` for `end` reads to the end of the object.
+    pub async fn get_object_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        validate_key(key)?;
+
+        if let Some(end) = end {
+            if end < start {
+                return Err(Error::invalid_argument(
+                    "end",
+                    format!("range end {end} is before range start {start}"),
+                ));
+            }
+        }
+
+        let range = match end {
+            Some(end) => format!("bytes={start}-{end}"),
+            None => format!("bytes={start}-"),
+        };
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range)
+            .send()
+            .await
+            .map_err(|err| self.map_object_error("get_object", key, err))?;
+
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .map_err(|err| Error::Body(Box::new(err)))?;
+        Ok(bytes.into_bytes().to_vec())
+    }
+
+    /// Opens an object's body as a stream, without buffering it in memory.
+    pub async fn get_object_stream(&self, key: &str) -> Result<ByteStream> {
+        validate_key(key)?;
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| self.map_object_error("get_object", key, err))?;
+
+        Ok(response.body)
+    }
+
+    /// Reads an object's metadata without transferring its body.
+    pub async fn head_object(&self, key: &str) -> Result<ObjectMetadata> {
+        validate_key(key)?;
+
+        let response = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| self.map_object_error("head_object", key, err))?;
+
+        Ok(ObjectMetadata {
+            content_length: response.content_length.unwrap_or_default(),
+            content_type: response.content_type,
+            etag: response.e_tag,
+            last_modified: response.last_modified,
+            cache_control: response.cache_control,
+            content_disposition: response.content_disposition,
+            content_encoding: response.content_encoding,
+            content_language: response.content_language,
+            metadata: response.metadata.unwrap_or_default(),
+        })
+    }
+
+    /// Reports whether an object exists.
+    ///
+    /// A permission failure is an error, not `false`.
+    pub async fn object_exists(&self, key: &str) -> Result<bool> {
+        match self.head_object(key).await {
+            Ok(_) => Ok(true),
+            Err(err) if err.is_not_found() => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Copies an object within this bucket.
+    pub async fn copy_object(&self, source_key: &str, destination_key: &str) -> Result<()> {
+        self.copy_object_from(&self.bucket.clone(), source_key, destination_key)
+            .await
+    }
+
+    /// Copies an object from another bucket on the same account into this one.
+    pub async fn copy_object_from(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        destination_key: &str,
+    ) -> Result<()> {
+        validate_key(source_key)?;
+        validate_key(destination_key)?;
+
+        if source_bucket.trim().is_empty() {
+            return Err(Error::invalid_argument(
+                "source_bucket",
+                "source bucket must not be empty",
+            ));
+        }
+
+        let copy_source = format!("{source_bucket}/{}", encode_copy_source(source_key));
+
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .key(destination_key)
+            .copy_source(copy_source)
+            .send()
+            .await
+            .map_err(|err| {
+                let err = from_sdk("copy_object", err);
+                if err.is_not_found() {
+                    // The missing object is the source, which may well live in
+                    // another bucket; naming this one would be wrong.
+                    Error::ObjectNotFound {
+                        bucket: source_bucket.to_string(),
+                        key: source_key.to_string(),
+                    }
+                } else {
+                    err
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Deletes a single object.
+    ///
+    /// Deleting a key that does not exist succeeds, matching S3 semantics.
+    pub async fn delete_object(&self, key: &str) -> Result<()> {
+        validate_key(key)?;
+
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| from_sdk("delete_object", err))?;
+        Ok(())
+    }
+
+    /// Deletes many objects, batching into requests of
+    /// [`MAX_DELETE_BATCH`] keys.
+    ///
+    /// Every key is validated before the first request goes out, so an invalid
+    /// key never leaves a partially-applied delete behind. Per-key failures
+    /// reported by the service are collected in the returned [`DeleteReport`]
+    /// rather than aborting the remaining batches; check
+    /// [`all_succeeded`](DeleteReport::all_succeeded).
+    pub async fn delete_objects<I, K>(&self, keys: I) -> Result<DeleteReport>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
+
+        // Validate everything up front: a bad key in batch three must not
+        // leave batches one and two irreversibly deleted.
+        for key in &keys {
+            validate_key(key)?;
+        }
+
+        let mut report = DeleteReport::default();
+
+        for batch in keys.chunks(MAX_DELETE_BATCH) {
+            let mut identifiers = Vec::with_capacity(batch.len());
+            for key in batch {
+                identifiers.push(
+                    ObjectIdentifier::builder()
+                        .key(key)
+                        .build()
+                        .map_err(|err| Error::invalid_argument("keys", err.to_string()))?,
+                );
+            }
+
+            let delete = Delete::builder()
+                .set_objects(Some(identifiers))
+                .build()
+                .map_err(|err| Error::invalid_argument("keys", err.to_string()))?;
+
+            let response = self
+                .client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete)
+                .send()
+                .await
+                .map_err(|err| from_sdk("delete_objects", err))?;
+
+            report.deleted.extend(
+                response
+                    .deleted
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|deleted| deleted.key),
+            );
+            report.failed.extend(
+                response
+                    .errors
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|error| DeleteFailure {
+                        key: error.key.unwrap_or_default(),
+                        code: error.code,
+                        message: error.message,
+                    }),
+            );
+        }
+
+        Ok(report)
+    }
+
+    /// Deletes every object under a prefix.
+    ///
+    /// Refuses an empty prefix — use [`delete_objects`](R2Client::delete_objects)
+    /// with an explicit list if you really mean to empty the bucket.
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<DeleteReport> {
+        if prefix.is_empty() {
+            return Err(Error::invalid_argument(
+                "prefix",
+                "refusing to delete with an empty prefix, which would empty the bucket",
+            ));
+        }
+
+        let keys: Vec<String> = self
+            .list_all_objects(Some(prefix))
+            .await?
+            .into_iter()
+            .map(|object| object.key)
+            .collect();
+
+        if keys.is_empty() {
+            return Ok(DeleteReport::default());
+        }
+
+        self.delete_objects(keys).await
+    }
+
+    /// Lists one page of objects.
+    ///
+    /// Follow [`ListPage::next_continuation_token`] to page through the rest,
+    /// or use [`list_all_objects`](R2Client::list_all_objects).
+    pub async fn list_objects(&self, options: ListOptions) -> Result<ListPage> {
+        let response = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .set_prefix(options.prefix)
+            .set_delimiter(options.delimiter)
+            .set_max_keys(options.max_keys)
+            .set_start_after(options.start_after)
+            .set_continuation_token(options.continuation_token)
+            .send()
+            .await
+            .map_err(|err| from_sdk("list_objects_v2", err))?;
+
+        let objects = response
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|object| {
+                object.key.map(|key| ObjectSummary {
+                    key,
+                    size: object.size.unwrap_or_default(),
+                    etag: object.e_tag,
+                    last_modified: object.last_modified,
+                })
+            })
+            .collect();
+
+        let common_prefixes = response
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+
+        Ok(ListPage {
+            objects,
+            common_prefixes,
+            next_continuation_token: response.next_continuation_token,
+            is_truncated: response.is_truncated.unwrap_or(false),
+        })
+    }
+
+    /// Lists every object under an optional prefix, following pagination.
+    pub async fn list_all_objects(&self, prefix: Option<&str>) -> Result<Vec<ObjectSummary>> {
+        let mut objects = Vec::new();
+        let mut continuation_token = None;
+
+        loop {
+            let mut options = ListOptions::new();
+            if let Some(prefix) = prefix {
+                options = options.prefix(prefix);
+            }
+            options.continuation_token = continuation_token;
+
+            let page = self.list_objects(options).await?;
+            objects.extend(page.objects);
+
+            match page.next_continuation_token {
+                // Guard against a truncated page with no token, which would
+                // otherwise loop forever re-reading page one.
+                Some(token) if page.is_truncated => continuation_token = Some(token),
+                _ => break,
+            }
+        }
+
+        Ok(objects)
+    }
+
+    /// Lists every key in the bucket.
+    pub async fn list_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_all_objects(None)
+            .await?
+            .into_iter()
+            .map(|object| object.key)
+            .collect())
+    }
+
+    /// Lists the immediate "folders" under a prefix, using `/` as the delimiter.
+    pub async fn list_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut prefixes = Vec::new();
+        let mut continuation_token = None;
+
+        loop {
+            let mut options = ListOptions::new().prefix(prefix).delimiter("/");
+            options.continuation_token = continuation_token;
+
+            let page = self.list_objects(options).await?;
+            prefixes.extend(page.common_prefixes);
+
+            match page.next_continuation_token {
+                Some(token) if page.is_truncated => continuation_token = Some(token),
+                _ => break,
+            }
+        }
+
+        Ok(prefixes)
+    }
+
+    /// Downloads an object into `directory`, mirroring the key's path.
+    ///
+    /// A key of `photos/2024/cat.png` lands at `<directory>/photos/2024/cat.png`,
+    /// creating intermediate directories as needed. Returns the written path.
+    ///
+    /// The key is treated as untrusted: anything that would resolve outside
+    /// `directory` — an absolute key, a `..` segment, a Windows drive prefix,
+    /// or a backslash that would be a separator on Windows — is rejected with
+    /// [`Error::InvalidArgument`]. Such keys are legal in R2, so use
+    /// [`download_to`](R2Client::download_to) with an explicit destination if
+    /// you need to fetch one.
+    pub async fn download_file(&self, key: &str, directory: &Path) -> Result<PathBuf> {
+        validate_key(key)?;
+
+        if !directory.is_dir() {
+            return Err(Error::invalid_argument(
+                "directory",
+                format!("{} is not a directory", directory.display()),
+            ));
+        }
+
+        let destination = safe_join(directory, key)?;
+        self.download_to(key, &destination).await?;
+        Ok(destination)
+    }
+
+    /// Downloads an object to an exact path, streaming it to disk.
+    ///
+    /// Creates parent directories as needed and returns the number of bytes
+    /// written. The download lands atomically: bytes go to a temporary file
+    /// beside the destination and are renamed into place only once the whole
+    /// body has arrived, so an interrupted transfer never leaves a truncated
+    /// file where a complete one is expected.
+    ///
+    /// The destination is used exactly as given; it is the caller's path, not
+    /// the object's, so no key-derived traversal is possible here.
+    pub async fn download_to(&self, key: &str, destination: &Path) -> Result<u64> {
+        validate_key(key)?;
+
+        // Checked before the transfer, not after: discovering this by failing
+        // to create the file would mean pulling the whole body down first.
+        if destination.is_dir() {
+            return Err(Error::invalid_argument(
+                "destination",
+                format!(
+                    "{} is a directory; pass the full file path to write",
+                    destination.display()
+                ),
+            ));
+        }
+
+        if let Some(parent) = destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                    Error::file(parent, "could not create the parent directory", Some(err))
+                })?;
+            }
+        }
+
+        let temporary = temporary_path(destination);
+        let mut stream = self.get_object_stream(key).await?;
+
+        let written = match stream_to_file(&mut stream, &temporary).await {
+            Ok(written) => written,
+            Err(err) => {
+                // Best effort: leaving the partial file behind would be worse
+                // than losing the (already reported) cleanup failure.
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = tokio::fs::rename(&temporary, destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(Error::file(
+                destination,
+                "could not move the completed download into place",
+                Some(err),
+            ));
+        }
+
+        Ok(written)
+    }
+
+    /// Turns a 404 on a keyed operation into [`Error::ObjectNotFound`], so
+    /// callers can match on "missing" without inspecting status codes.
+    pub(crate) fn map_object_error<E>(
+        &self,
+        operation: &'static str,
+        key: &str,
+        err: aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>,
+    ) -> Error
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let err = from_sdk(operation, err);
+        if err.is_not_found() {
+            Error::ObjectNotFound {
+                bucket: self.bucket.clone(),
+                key: key.to_string(),
+            }
+        } else {
+            err
+        }
+    }
+}
+
+/// Streams a response body into a file, returning the byte count.
+async fn stream_to_file(stream: &mut ByteStream, path: &Path) -> Result<u64> {
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|err| Error::file(path, "could not create the download file", Some(err)))?;
+    let mut written = 0u64;
+
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|err| Error::Body(Box::new(err)))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| Error::file(path, "could not write the download", Some(err)))?;
+        written += chunk.len() as u64;
+    }
+
+    file.flush()
+        .await
+        .map_err(|err| Error::file(path, "could not flush the download", Some(err)))?;
+    Ok(written)
+}
+
+/// Builds a sibling path for the in-progress download.
+///
+/// Same directory as the destination, so the final rename stays on one
+/// filesystem and is therefore atomic.
+///
+/// The name is built from the process ID and a counter rather than from the
+/// destination's file name: most filesystems cap a single name at 255 bytes,
+/// and appending a suffix to an already-long key segment would fail with
+/// `ENAMETOOLONG` on keys that are otherwise perfectly valid.
+fn temporary_path(destination: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!(".r2partial.{}.{unique}", std::process::id());
+
+    match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Validates a key for a *network* operation.
+///
+/// Deliberately permissive: `..`, leading slashes and backslashes are all
+/// legal in an R2 key, and refusing them here would make objects that exist
+/// unreachable. Only genuinely unusable keys are rejected. Filesystem safety
+/// is enforced separately by [`safe_join`], at the point where a key becomes
+/// a path.
+pub(crate) fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Err(Error::invalid_argument("key", "key must not be empty"));
+    }
+
+    if key.contains('\0') {
+        return Err(Error::invalid_argument(
+            "key",
+            "key must not contain a NUL byte",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Joins an untrusted key onto a directory, refusing anything that escapes it.
+pub(crate) fn safe_join(directory: &Path, key: &str) -> Result<PathBuf> {
+    let reject = |reason: &str| {
+        Err(Error::invalid_argument(
+            "key",
+            format!(
+                "key `{key}` cannot be written under a directory: {reason}. \
+                 Use download_to() with an explicit destination path instead."
+            ),
+        ))
+    };
+
+    // A backslash is a path separator on Windows, so a key containing one
+    // would traverse differently depending on the platform. Reject it
+    // everywhere rather than be safe on Linux and exploitable on Windows.
+    if key.contains('\\') {
+        return reject("it contains a backslash");
+    }
+
+    let relative = Path::new(key);
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => return reject("it contains a `..` segment"),
+            Component::RootDir => return reject("it is an absolute path"),
+            Component::Prefix(_) => return reject("it has a filesystem prefix"),
+        }
+    }
+
+    // A key of "." or "./" resolves to the directory itself, not a file.
+    let joined = directory.join(relative);
+    if joined == directory {
+        return reject("it does not name a file");
+    }
+
+    Ok(joined)
+}
+
+/// Percent-encodes a key for use in a `x-amz-copy-source` header.
+///
+/// `/` is left intact because the header is `bucket/key` and R2 expects the
+/// key's own slashes to stay literal.
+pub(crate) fn encode_copy_source(key: &str) -> String {
+    let mut encoded = String::with_capacity(key.len());
+    for byte in key.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_key() {
+        assert!(validate_key("").is_err());
+    }
+
+    #[test]
+    fn rejects_nul_in_key() {
+        assert!(validate_key("a\0b").is_err());
+    }
+
+    #[test]
+    fn network_operations_accept_keys_that_look_like_traversal() {
+        // These are legal R2 keys. Refusing them would make real objects
+        // unreachable; only the filesystem join needs to care.
+        assert!(validate_key("../../etc/passwd").is_ok());
+        assert!(validate_key("/leading-slash.txt").is_ok());
+        assert!(validate_key("a/../b").is_ok());
+        assert!(validate_key("photos/2024/cat.png").is_ok());
+    }
+
+    #[test]
+    fn safe_join_accepts_ordinary_keys() {
+        let base = Path::new("/tmp/dl");
+        assert_eq!(
+            safe_join(base, "photos/2024/cat.png").unwrap(),
+            base.join("photos/2024/cat.png")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_segments() {
+        assert!(safe_join(Path::new("/tmp/dl"), "../escape.txt").is_err());
+        assert!(safe_join(Path::new("/tmp/dl"), "a/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_keys() {
+        // Path::join would silently discard the base directory here.
+        assert!(safe_join(Path::new("/tmp/dl"), "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_backslashes_on_every_platform() {
+        assert!(safe_join(Path::new("/tmp/dl"), "..\\escape.txt").is_err());
+        assert!(safe_join(Path::new("/tmp/dl"), "C:\\Windows\\system32").is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_keys_that_name_no_file() {
+        assert!(safe_join(Path::new("/tmp/dl"), ".").is_err());
+        assert!(safe_join(Path::new("/tmp/dl"), "./").is_err());
+    }
+
+    #[test]
+    fn safe_join_keeps_the_result_under_the_directory() {
+        let base = Path::new("/tmp/dl");
+        for key in ["a.txt", "a/b/c.txt", "./a.txt"] {
+            let joined = safe_join(base, key).unwrap();
+            assert!(joined.starts_with(base), "{key} escaped to {joined:?}");
+        }
+    }
+
+    #[test]
+    fn temporary_path_is_a_sibling_of_the_destination() {
+        let temporary = temporary_path(Path::new("/tmp/dl/file.bin"));
+        assert_eq!(temporary.parent(), Some(Path::new("/tmp/dl")));
+        assert_ne!(temporary, PathBuf::from("/tmp/dl/file.bin"));
+    }
+
+    #[test]
+    fn temporary_path_stays_within_the_filename_length_limit() {
+        // A 250-byte final segment is a legal key and a legal filename; the
+        // temporary name must not push it over the 255-byte cap.
+        let long = "n".repeat(250);
+        let temporary = temporary_path(Path::new(&format!("/tmp/dl/{long}")));
+        let name = temporary.file_name().unwrap().len();
+        assert!(name <= 255, "temporary file name was {name} bytes");
+    }
+
+    #[test]
+    fn temporary_paths_are_unique() {
+        let destination = Path::new("/tmp/dl/file.bin");
+        assert_ne!(temporary_path(destination), temporary_path(destination));
+    }
+
+    #[test]
+    fn copy_source_leaves_safe_characters_alone() {
+        assert_eq!(encode_copy_source("photos/cat-1.png"), "photos/cat-1.png");
+    }
+
+    #[test]
+    fn copy_source_encodes_spaces_and_specials() {
+        assert_eq!(
+            encode_copy_source("my folder/a+b&c.png"),
+            "my%20folder/a%2Bb%26c.png"
+        );
+    }
+
+    #[test]
+    fn copy_source_encodes_non_ascii() {
+        assert_eq!(encode_copy_source("caf\u{e9}.txt"), "caf%C3%A9.txt");
+    }
+}
